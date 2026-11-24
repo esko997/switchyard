@@ -152,8 +152,10 @@ field inventory below is mechanically checked against the models by
   placement binding). Private escrow/access control and at-rest protection are
   mandatory for datasets with `value` locations.
 - **Endpoint:** component owner, `protocol: tcp|udp`, `target_port`, and a free-text
-  `consumers` checklist. Address/host port exist only in Placement. Publishing must
-  account for PWA/bookmark origins, firewall rules and operational wrappers; no
+  `consumers` checklist. Declare optional `scheme: http|https` on TCP for web
+  endpoints; an HTTP health check on that endpoint must use the same scheme.
+  Address and host port exist only in Placement. Publishing must account for
+  PWA/bookmark origins, firewall rules and operational wrappers; no
   implicit DNS/proxy update exists. Two endpoints may share a container port with
   different protocols (DNS over UDP and TCP); their claims then share the host port.
 - **Parameter:** `{id, description, format, default, value}` names one per-instance
@@ -621,7 +623,7 @@ values, unions, constraints and defaults are specified above and in the models.
 | `Dataset` | `id`, `snapshot`, `verify`, `writers`, `readers`, `external_actors`, `include`, `exclude`, `health_files` |
 | `SecretLocation` | `id`, `form`, `role`, `component`, `external_dependency`, `dataset` |
 | `Secret` | `id`, `kind`, `consumers`, `transfer`, `rotates_on_use`, `locations` |
-| `Endpoint` | `id`, `component`, `protocol`, `target_port`, `consumers` |
+| `Endpoint` | `id`, `component`, `protocol`, `target_port`, `consumers`, `scheme` |
 | `Capacity` | `memory_mib`, `disk_gib`, `gpu` |
 | `Requirement` | `name`, `components`, `capacity`, `probe_ref` |
 | `ExternalDependency` | `id`, `description`, `probe_ref`, `secret_ref` |

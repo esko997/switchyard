@@ -382,6 +382,15 @@ span.row-sub:has(> span) { display: flex; flex-wrap: wrap; gap: .1rem .8rem; ali
 .approval .button { margin-top: .9rem; }
 .definition-editor > .button { margin-bottom: .2rem; }
 #definition-supporting-field { margin-top: .9rem; }
+.definition-endpoint-fields { min-width: 0; margin: .9rem 0; padding: .6rem 0 0; border: 0; border-top: 1px solid var(--rule); }
+.definition-endpoint-fields legend { padding: 0 .4rem 0 0; font-size: .875rem; font-weight: 600; }
+.definition-endpoint-fields .optional { color: var(--muted); font-weight: 400; }
+.definition-endpoint-fields > .field-note { margin-top: 0; }
+.definition-endpoint-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem .8rem; padding: .6rem 0; border-bottom: 1px solid var(--rule); }
+.definition-endpoint-row label, .definition-endpoint-row input, .definition-endpoint-row select { min-width: 0; }
+.definition-endpoint-address { grid-column: 1 / -1; }
+.definition-endpoint-row > .button { justify-self: start; align-self: end; }
+.definition-endpoint-fields > .button { margin-top: .4rem; }
 .host-editor fieldset { min-width: 0; margin: 1rem 0; padding: .6rem .9rem 0; border: 1px solid var(--rule); border-radius: 3px; }
 .host-editor legend { padding-inline: .3rem; font-size: .875rem; font-weight: 600; }
 .host-editor fieldset:disabled legend { color: var(--muted); }

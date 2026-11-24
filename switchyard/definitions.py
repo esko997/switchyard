@@ -1,5 +1,6 @@
 """Deliberate workload definitions and read-only native-resource bindings."""
 from copy import deepcopy
+from ipaddress import ip_address
 import json
 import math
 import re
@@ -23,7 +24,7 @@ _FIELDS = {
 }
 # Optional on input (catalog seeds and definitions written before it), always present on output: how the native
 # runtime starts and stops the workload (`spec.Runtime`), description only.
-_OPTIONAL = {"runtime"}
+_OPTIONAL = {"runtime", "endpoints"}
 _OPERATIONS = ["observe", "plan-migration"]
 
 
@@ -37,6 +38,32 @@ def _runtime(value, backend, kind):
         details = "; ".join(".".join(str(p) for p in e["loc"]) + ": " + e["msg"] for e in error.errors()[:5])
         raise ValueError("Invalid workload runtime: " + details) from None
     return native.model_dump(mode="json")["runtime"]
+
+
+def _web_endpoints(value, kind):
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("Workload endpoints must be a list of at most 16 entries")
+    if value and kind != "service":
+        raise ValueError("Only service definitions can declare endpoints")
+    result, ids, listeners = [], set(), set()
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"id", "address", "port", "scheme"}:
+            raise ValueError("Workload endpoint needs ID, bind address, port and scheme")
+        endpoint = _identifier(entry["id"], "workload endpoint ID")
+        address, port, scheme = entry["address"], entry["port"], entry["scheme"]
+        try:
+            if not isinstance(address, str) or "%" in address or str(ip_address(address)) != address:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Workload endpoint needs a canonical IPv4 or IPv6 bind address") from None
+        if type(port) is not int or not 1 <= port <= 65535 or scheme not in ("http", "https"):
+            raise ValueError("Workload endpoint needs port 1-65535 and HTTP or HTTPS")
+        if endpoint in ids or (address, port) in listeners:
+            raise ValueError("Duplicate workload endpoint ID or listener")
+        ids.add(endpoint)
+        listeners.add((address, port))
+        result.append({"id": endpoint, "address": address, "port": port, "scheme": scheme})
+    return result
 
 
 def _text(value, label, limit=4096):
@@ -151,6 +178,7 @@ def validate_definitions(records, host_ids) -> list[dict]:
         for dependency in dependencies:
             _identifier(dependency, "dependency ID")
         health_check = record["health_check"]
+        endpoints = _web_endpoints(record.get("endpoints", []), record["kind"])
         result.append({
             "id": identity, "name": _text(record["name"], "workload name"),
             "purpose": _text(record["purpose"], "workload purpose", 8192),
@@ -162,6 +190,7 @@ def validate_definitions(records, host_ids) -> list[dict]:
             "data_locations": _strings(record["data_locations"], "data_locations"),
             "dependencies": dependencies, "supported_operations": list(_OPERATIONS),
             "runtime": _runtime(record.get("runtime"), backend, record["kind"]),
+            **({"endpoints": endpoints} if endpoints else {}),
         })
     graph = {record["id"]: record["dependencies"] for record in result}
     if any(dependency not in graph for dependencies in graph.values() for dependency in dependencies):

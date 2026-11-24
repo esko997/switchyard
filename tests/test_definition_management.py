@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from switchyard import lan_route_config
 from switchyard.core import Service
 from test_observations import snapshot
 
@@ -93,6 +94,34 @@ class DefinitionManagementTests(unittest.TestCase):
         self.assertEqual(provenance["method"], "cached-discovery")
         self.assertEqual(provenance["source_evidence"][0]["native_id"], "notes.service")
         self.assertEqual(self.service.definition_inventory()["workloads"], [saved["definition"]])
+
+    def test_reviewed_web_endpoint_becomes_a_route_candidate_without_publishing(self):
+        saved = self.save()
+        endpoint = {"id": "desk", "address": "192.168.50.104", "port": 8710, "scheme": "http"}
+        definition = {**saved["definition"], "endpoints": [endpoint]}
+        updated = self.service.update_workload_definition("notes", definition, expected_revision=saved["revision"])
+        other = self.new_service()
+        self.assertEqual(other.definition_inventory()["workloads"][0]["endpoints"], [endpoint])
+        config = lan_route_config.normalize({"gateway_id": "lan-web", "dns_id": "lan-dns",
+                                              "zone": "example.test", "ca_sha256": "a" * 64})
+        hosts = [{"id": "source", "collector": {"transport": "ssh", "target": "fixture@192.168.50.104"},
+                  "verification": {"state": "verified"}}]
+        rows = lan_route_config.endpoint_candidates(other._store, config, hosts=hosts)
+        plan = lan_route_config.route(config, rows, "notes-desk", "notes", "desk")
+        self.assertEqual((plan["address"], plan["port"], plan["scheme"]), ("192.168.50.104", 8710, "http"))
+        other.update_workload_definition("notes", {**updated["definition"], "endpoints": []},
+                                         expected_revision=updated["revision"])
+        self.assertEqual(lan_route_config.endpoint_candidates(other._store, config, hosts=hosts), [])
+
+    def test_endpoint_metadata_rejects_false_port_urls_and_duplicate_ids(self):
+        proposal = self.proposal()
+        endpoint = {"id": "web", "address": "192.168.50.104", "port": 8080, "scheme": "http"}
+        for entries in ([{**endpoint, "port": True}], [{**endpoint, "address": "http://192.168.50.104"}],
+                        [endpoint, {**endpoint, "port": 8081}]):
+            with self.subTest(entries=entries), self.assertRaisesRegex(ValueError, "[Ee]ndpoint"):
+                self.service.save_workload_definition({**proposal["definition"], "endpoints": entries},
+                                                      expected_revision=proposal["revision"])
+        self.assertEqual(self.service.definition_inventory()["workloads"], [])
 
     def test_other_live_service_refreshes_all_views_and_retains_cache_namespace(self):
         other = self.new_service()

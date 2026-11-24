@@ -147,6 +147,12 @@
               </div>
               <label for="definition-purpose">Purpose<textarea id="definition-purpose" rows="3" maxlength="8192" required></textarea></label>
               <div id="definition-supporting-field"><label for="definition-supporting">Supporting units and containers<select id="definition-supporting" multiple size="4"></select></label><p class="field-note">Optional. Others on the same host that belong to this workload. Selecting one does not imply a dependency or grant control.</p></div>
+              <fieldset id="definition-endpoint-fields" class="definition-endpoint-fields" aria-describedby="definition-endpoints-note">
+                <legend>Web endpoints <span class="optional">optional</span></legend>
+                <p id="definition-endpoints-note" class="field-note">Declare each listener’s LAN IP address, not a URL. Eligible endpoints become choices in LAN URLs; saving a declaration never publishes a name or creates a route.</p>
+                <div id="definition-endpoints" class="definition-endpoints"></div>
+                <button id="add-definition-endpoint" class="button quiet" type="button">Add endpoint</button>
+              </fieldset>
               <div class="shell-actions"><button id="review-definition" class="button secondary" type="submit">Review definition</button><button id="cancel-definition" class="button quiet" type="button">Close editor</button></div>
             </form>
             <div id="definition-review" class="selection-context"></div>
@@ -178,8 +184,9 @@
           <div id="lan-dns-list" class="lan-list"><p class="empty-state">Loading DNS records.</p></div>
           <details id="lan-endpoint-section" class="support-details">
             <summary><span>Endpoints without a LAN URL <span id="lan-endpoint-count" class="count"></span></span></summary>
-            <p class="section-note">Web endpoints that workloads declare and no name leads to yet.</p>
+            <p class="section-note">Eligible web endpoints declared by workloads, with no published name leading to them yet. Declaring an endpoint does not create a route.</p>
             <div id="lan-endpoint-list" class="table-scroll"></div>
+            <div id="lan-endpoint-exclusions"></div>
           </details>
         </div>
         <aside class="side-desk" aria-label="LAN URL and DNS record editor">
@@ -194,7 +201,7 @@
               </div>
               <div id="lan-url-endpoint-field" class="lan-field">
                 <label for="lan-url-endpoint">Workload endpoint<select id="lan-url-endpoint" aria-describedby="lan-url-endpoint-note lan-url-endpoint-error"></select></label>
-                <span id="lan-url-endpoint-note" class="field-note">Where the name leads. Only endpoints that workloads declare are offered.</span>
+                <span id="lan-url-endpoint-note" class="field-note">Only eligible declared endpoints are offered. Selecting one creates no route until you preview and approve publication.</span>
                 <span id="lan-url-endpoint-error" class="field-error" hidden></span>
               </div>
               <div id="lan-dns-address-field" class="lan-field" hidden>

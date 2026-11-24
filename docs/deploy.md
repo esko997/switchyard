@@ -476,13 +476,43 @@ Switchyard lists generated host records separately; change their source in the h
 not in the DNS editor.
 
 Publication is opt-in (`<catalog basename>.lan-routes.json` beside the catalog). The private
-file selects one existing `caddy-lan` gateway deployment, one `coredns-lan` deployment
-and a zone, pins the Caddy CA fingerprint, and can declare existing non-deployed endpoint
-bindings. The gateway owns the private LAN address on TCP 80/443 and persists its TLS state.
+file selects the existing `caddy-lan` and `coredns-lan` deployments, the DNS zone, and the
+Caddy CA fingerprint. The gateway uses the private LAN address on TCP 80/443 and persists its TLS state.
 Users must trust its CA and resolve the zone through CoreDNS. Use it as the DHCP DNS server
 (or send this zone to it via split DNS); a second resolver that does not serve the zone can
-return `NXDOMAIN` instead of falling back. Discovery never grants permission to publish.
-The desk accepts workload and endpoint IDs, not arbitrary upstream URLs or raw configuration.
+return `NXDOMAIN` instead of falling back.
+
+**Candidates come from workloads.** Declare `scheme: http` or `scheme: https` on the
+application's TCP endpoint and bind it to an exact private IPv4 address and port in its
+placement. For an observed service, use **Edit definition → Web endpoints** to save both
+pieces in the workload store. A registered application uses its bundle's declarations;
+a deployment uses its current placement. Older applications with an unambiguous HTTP
+check can still supply the scheme. No check has to run to list candidates.
+Loopback, wildcard, non-web and ambiguous targets are not eligible. An adopted endpoint's
+address must match its registry host. Selecting a target plans a change; saving an
+endpoint never writes Caddy or DNS.
+
+Use `upstream_policies` in the private LAN URL config for per-endpoint proxy policy, not
+for addresses. For example, a verified HTTPS upstream needs a trusted CA already in the
+gateway deployment's config files:
+
+```json
+{
+  "upstream_policies": [
+    {
+      "workload_id": "desk",
+      "endpoint_id": "https",
+      "profile": "verified-https",
+      "ca_file": "desk-ca.pem",
+      "hostnames": ["desk.example.test"]
+    }
+  ]
+}
+```
+
+`hostnames` is optional and constrains the public names; it does not change the backend's
+Host or Origin checks. Existing `observed_endpoints` entries keep their behavior for
+existing installations. Do not add a second address entry for new workload declarations.
 Caddy does not add authentication to the backend.
 
 To adopt existing records, the operator supplies the exact existing Caddyfile SHA-256

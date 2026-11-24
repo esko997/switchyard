@@ -41,6 +41,7 @@
   const editor = {
     panel: byId("definition-editor"), form: byId("definition-form"), id: byId("definition-id"),
     name: byId("definition-name"), purpose: byId("definition-purpose"), supporting: byId("definition-supporting"),
+    endpoints: byId("definition-endpoints"), endpointFields: byId("definition-endpoint-fields"), addEndpoint: byId("add-definition-endpoint"),
     review: byId("definition-review"), save: byId("save-definition"),
     status: byId("definition-status"), error: byId("definition-error"),
   };
@@ -53,6 +54,7 @@
   let definitionPending = false;
   let definitionReviewed = null;
   let definitionReviewFleetRevision = null;
+  let definitionEndpointSequence = 0;
   const hostEditor = {
     panel: byId("host-editor"), form: byId("host-form"), status: byId("host-editor-status"), error: byId("host-editor-error"),
     connection: byId("host-connection"), review: byId("host-review"), save: byId("save-host"),
@@ -2426,6 +2428,84 @@
     editor.review.replaceChildren();
     editor.status.textContent = "Draft changed. Review the definition before saving.";
   }
+  function changeDefinitionEndpoints() {
+    if (!definitionDraft || definitionPending) return;
+    definitionDraft.endpointsChanged = true;
+    invalidateDefinitionReview();
+    definitionControls();
+  }
+  function appendDefinitionEndpoint(endpoint = {}, focus = false) {
+    const row = node("div", undefined, "definition-endpoint-row");
+    const key = `definition-endpoint-${++definitionEndpointSequence}`;
+    for (const [name, title] of [["id", "Endpoint ID"], ["scheme", "Scheme"], ["address", "LAN IP address"], ["port", "Port"]]) {
+      const label = node("label", title, name === "address" ? "definition-endpoint-address" : "");
+      const field = node(name === "scheme" ? "select" : "input");
+      field.id = `${key}-${name}`;
+      field.name = name;
+      field.dataset.endpointField = name;
+      field.dataset.focusKey = field.id;
+      label.htmlFor = field.id;
+      field.required = true;
+      if (name === "scheme") {
+        setOptions(field, [["http", "HTTP"], ["https", "HTTPS"]]);
+      } else {
+        field.autocomplete = "off";
+        field.spellcheck = false;
+        field.className = "machine";
+        if (name === "port") {
+          field.type = "number";
+          field.min = "1";
+          field.max = "65535";
+          field.step = "1";
+          field.inputMode = "numeric";
+        } else if (name === "id") {
+          field.maxLength = 64;
+          field.pattern = "[a-z0-9][a-z0-9\\-]{0,63}";
+          field.title = "Lowercase letters, numbers and hyphens; unique within this workload.";
+        } else {
+          field.maxLength = 45;
+          field.pattern = "[0-9A-Fa-f:.]+";
+          field.placeholder = "192.168.1.10";
+          field.title = "IPv4 or IPv6 address, without a scheme, port, path or brackets.";
+          field.setAttribute("aria-describedby", "definition-endpoints-note");
+        }
+      }
+      field.value = endpoint[name] ?? (name === "scheme" ? "http" : "");
+      label.append(field);
+      row.append(label);
+    }
+    const remove = node("button", "Remove endpoint", "button quiet");
+    remove.type = "button";
+    remove.dataset.focusKey = `${key}-remove`;
+    remove.addEventListener("click", () => {
+      if (definitionPending || !definitionDraft) return;
+      const next = row.nextElementSibling || row.previousElementSibling;
+      row.remove();
+      changeDefinitionEndpoints();
+      (next?.querySelector("input") || editor.addEndpoint).focus({ preventScroll: true });
+    });
+    row.append(remove);
+    editor.endpoints.append(row);
+    if (focus) row.querySelector("input").focus({ preventScroll: true });
+  }
+  function definitionEndpoints() {
+    const ids = new Set(), listeners = new Set();
+    return Array.from(editor.endpoints.children, (row) => {
+      const endpoint = Object.fromEntries(Array.from(row.querySelectorAll("[data-endpoint-field]"),
+        (field) => [field.dataset.endpointField, field.value.trim()]));
+      endpoint.port = Number(endpoint.port);
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(endpoint.id) || !/^[0-9a-f:.]+$/i.test(endpoint.address)
+          || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535
+          || !["http", "https"].includes(endpoint.scheme)) {
+        throw new Error("Each endpoint needs an ID, a LAN IP address, a port from 1–65535, and HTTP or HTTPS.");
+      }
+      const listener = JSON.stringify([endpoint.address, endpoint.port]);
+      if (ids.has(endpoint.id) || listeners.has(listener)) throw new Error("Endpoint IDs and address/port pairs must be unique within this workload.");
+      ids.add(endpoint.id);
+      listeners.add(listener);
+      return endpoint;
+    });
+  }
   function definitionControls() {
     const stale = definitionReviewed && fleet?.definition_revision && definitionReviewed.revision !== fleet.definition_revision
       && definitionReviewFleetRevision !== fleet.definition_revision;
@@ -2433,6 +2513,8 @@
     byId("review-definition").disabled = definitionPending || !definitionDraft;
     byId("cancel-definition").disabled = definitionPending;
     [editor.id, editor.name, editor.purpose, editor.supporting].forEach((field) => { field.disabled = definitionPending || !definitionDraft; });
+    editor.endpointFields.disabled = definitionPending || !definitionDraft || editor.endpointFields.hidden;
+    editor.addEndpoint.disabled = editor.endpointFields.disabled || editor.endpoints.children.length >= 16;
     if (stale) editor.status.textContent = "The catalog changed. Your draft is kept. Review it again against the current definitions before saving; nothing is overwritten.";
   }
   async function openDefinition(resource, workloadId = null) {
@@ -2449,13 +2531,16 @@
       const inventory = workloadId ? await api("/api/definitions") : null;
       const original = workloadId ? array(inventory.workloads).find((item) => item.id === workloadId) : null;
       if (workloadId && !original) throw new Error("That definition no longer exists. Refresh to see the current list.");
-      definitionDraft = { resourceId: resource?.id, workloadId, original, revision: inventory?.revision };
+      definitionDraft = { resourceId: resource?.id, workloadId, original, revision: inventory?.revision, endpointsChanged: false };
       definitionReviewed = null;
       editor.form.reset();
       editor.id.value = workloadId || "";
       editor.id.readOnly = Boolean(workloadId);
       editor.name.value = original?.name || text(resource?.name, resource?.native_id);
       editor.purpose.value = original?.purpose || "";
+      editor.endpointFields.hidden = (original?.kind || resource?.kind) !== "service";
+      editor.endpoints.replaceChildren();
+      array(original?.endpoints).forEach((endpoint) => appendDefinitionEndpoint(endpoint));
       byId("definition-editor-title").textContent = workloadId ? `Edit ${original.name || workloadId}` : `Define ${text(resource.name, resource.native_id)}`;
       byId("definition-supporting-field").hidden = Boolean(workloadId);
       setOptions(editor.supporting, resource ? fleet.resources.filter((item) => item.id !== resource.id && item.host_id === resource.host_id
@@ -2486,28 +2571,35 @@
     editor.status.textContent = "Reviewing cached data and the current catalog revision.";
     try {
       let proposal;
+      const endpoints = definitionDraft.endpointsChanged ? definitionEndpoints() : null;
       if (definitionDraft.workloadId) {
         const inventory = await api("/api/definitions");
         const original = array(inventory.workloads).find((item) => item.id === definitionDraft.workloadId);
         if (!original) throw new Error("That definition no longer exists, so this draft cannot overwrite it.");
-        // Refresh untouched canonical fields, preserving only the explicitly edited
-        // description. Never replay old bindings over concurrent catalog changes.
-        proposal = { definition: { ...original, name: editor.name.value.trim(), purpose: editor.purpose.value.trim() },
+        // Refresh untouched canonical fields, preserving only explicitly edited
+        // fields. Never replay old bindings or endpoint declarations over concurrent changes.
+        proposal = { definition: { ...original, name: editor.name.value.trim(), purpose: editor.purpose.value.trim(),
+          ...(endpoints !== null ? { endpoints } : {}) },
           revision: inventory.revision, warnings: [], source_evidence: null };
         definitionDraft.original = original;
+        if (endpoints === null) {
+          editor.endpoints.replaceChildren();
+          array(original.endpoints).forEach((endpoint) => appendDefinitionEndpoint(endpoint));
+        }
       } else {
         proposal = await api("/api/definitions/propose", {
           resource_id: definitionDraft.resourceId, workload_id: editor.id.value.trim(),
           name: editor.name.value.trim(), purpose: editor.purpose.value.trim(),
           supporting_resource_ids: Array.from(editor.supporting.selectedOptions, (option) => option.value),
         });
+        if (endpoints !== null) proposal.definition = { ...proposal.definition, endpoints };
       }
       if (!proposal.definition || typeof proposal.revision !== "string") throw new Error("Invalid definition review response.");
       definitionReviewed = proposal;
       definitionReviewFleetRevision = fleet?.definition_revision;
       editor.review.replaceChildren(metadata([
         ["Workload", `${proposal.definition.name} (${proposal.definition.id})`], ["Catalog revision", proposal.revision],
-        ["Effect", "Definition only. No restart or deployment permission."],
+        ["Effect", "Definition only. No restart, deployment permission or LAN URL publication."],
       ]), list(strings(proposal.warnings), "No additional warnings supplied."),
       evidence("definition-reviewed-json", proposal.definition, "Exact definition to save"),
       evidence("definition-source-evidence", proposal.source_evidence, "Source data (cached, JSON)"));
@@ -2528,7 +2620,7 @@
       definitionDraft = null;
       definitionReviewed = null;
       editor.review.replaceChildren(metadata([["Saved", result.definition?.name || payload.definition.name], ["Revision", result.revision]]));
-      editor.status.textContent = "Definition saved. No restart, deployment or lifecycle permission was granted.";
+      editor.status.textContent = "Definition saved. No LAN URL was published; no restart, deployment or lifecycle permission was granted.";
       await loadFleet();
     } catch (cause) {
       definitionReviewed = null;
@@ -4174,6 +4266,7 @@
     publish: byId("publish-lan-url"), addDns: byId("add-lan-dns"), refresh: byId("refresh-lan-urls"), viewer: byId("lan-urls-viewer"),
     dnsList: byId("lan-dns-list"), dnsCount: byId("lan-dns-count"), availability: byId("lan-urls-availability"),
     status: byId("lan-urls-status"), error: byId("lan-urls-error"), endpoints: byId("lan-endpoint-list"), endpointCount: byId("lan-endpoint-count"),
+    exclusions: byId("lan-endpoint-exclusions"),
     editor: byId("lan-url-editor"), title: byId("lan-url-editor-title"), note: byId("lan-url-editor-note"), close: byId("close-lan-url-editor"),
     form: byId("lan-url-form"), hostnameField: byId("lan-url-hostname-field"), hostname: byId("lan-url-hostname"),
     hostnameNote: byId("lan-url-hostname-note"), hostnameError: byId("lan-url-hostname-error"),
@@ -4311,9 +4404,11 @@
     });
     const published = new Set(routes.map(endpointKey));
     const open = lanEndpoints().filter((item) => !published.has(endpointKey(item)));
+    const excluded = array(lan.data?.excluded).filter(record);
     lanUi.endpointCount.textContent = lanConfigured() ? String(open.length) : "";
     rerender(lanUi.endpoints, () => lanUi.endpoints.replaceChildren(!lanConfigured() ? empty("Nothing to show.")
-      : !open.length ? empty("Every declared web endpoint already has a name.")
+      : !open.length ? empty(excluded.length ? "No eligible endpoints are waiting for a name. Some declarations are not eligible; see the reasons below."
+        : "No eligible endpoints are waiting for a name.")
         : table(["Workload", "Endpoint", "Leads to", "Profile", ...(editable ? ["Action"] : [])], open.map((item) => {
           const key = endpointKey(item);
           const publish = button("Publish…", "secondary", `lan-publish:${key}`, () => openLanEditor("create", null, `lan-publish:${key}`, item));
@@ -4322,6 +4417,13 @@
           return [group("span", "", node("span", workloadTitle(item.workload_id)), node("span", text(item.workload_id), "row-sub machine")),
             node("span", text(item.endpoint_id), "machine"), node("span", lanTarget(item), "machine"), lanProfile(item), ...(editable ? [publish] : [])];
         }), "Declared web endpoints that no name leads to")));
+    rerender(lanUi.exclusions, () => lanUi.exclusions.replaceChildren(...(!lanConfigured() || !excluded.length ? [] : [
+      disclosure("lan-endpoint-exclusions", `Not eligible for publication (${excluded.length})`,
+        group("div", "table-scroll", table(["Workload", "Endpoint", "Why not eligible"], excluded.map((item) => [
+          group("span", "", node("span", workloadTitle(item.workload_id)), node("span", text(item.workload_id), "row-sub machine")),
+          node("span", text(item.endpoint_id), "machine"), text(item.reason),
+        ]), "Declared endpoints not eligible for LAN URL publication")), "support-details"),
+    ])));
     fillLanEndpoints();
     lanControls();
   }
@@ -4884,6 +4986,13 @@
   editor.form.addEventListener("submit", reviewDefinition);
   [editor.id, editor.name, editor.purpose].forEach((field) => field.addEventListener("input", invalidateDefinitionReview));
   editor.supporting.addEventListener("change", invalidateDefinitionReview);
+  editor.endpoints.addEventListener("input", changeDefinitionEndpoints);
+  editor.endpoints.addEventListener("change", changeDefinitionEndpoints);
+  editor.addEndpoint.addEventListener("click", () => {
+    if (editor.addEndpoint.disabled || !definitionDraft) return;
+    appendDefinitionEndpoint({}, true);
+    changeDefinitionEndpoints();
+  });
   editor.save.addEventListener("click", saveDefinition);
   byId("cancel-definition").addEventListener("click", () => {
     if (definitionPending) return;
@@ -4892,6 +5001,7 @@
     editor.panel.hidden = true;
     sideDesk();
     editor.form.reset();
+    editor.endpoints.replaceChildren();
     editor.review.replaceChildren();
     editor.status.textContent = "";
     error(editor.error, "");

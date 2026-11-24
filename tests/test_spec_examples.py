@@ -111,6 +111,21 @@ class SpecExamplesTests(unittest.TestCase):
                 value = spec.SpecBundle.model_validate_json(path.read_text())
                 self.assertEqual(value, spec.SpecBundle.model_validate(value.model_dump()))
 
+    def test_explicit_endpoint_scheme_is_tcp_only_and_agrees_with_http_check(self):
+        data = static_web()["applications"][0]
+        legacy = spec.Application.model_validate(data)
+        self.assertNotIn("scheme", legacy.model_dump()["endpoints"][0])
+        data["endpoints"][0]["scheme"] = "http"
+        model = spec.Application.model_validate(data)
+        self.assertEqual(model.endpoints[0].scheme, "http")
+        self.assertNotEqual(model.content_sha256(), legacy.content_sha256())
+        data["health_checks"][0]["scheme"] = "https"
+        with self.assertRaisesRegex(ValidationError, "check scheme does not match"):
+            spec.Application.model_validate(data)
+        with self.assertRaisesRegex(ValidationError, "requires TCP"):
+            spec.Endpoint.model_validate({"id": "web", "component": "web", "protocol": "udp",
+                                          "target_port": 8443, "scheme": "https"})
+
     def test_observed_components_are_only_watched(self):
         base = example("06-observed-job.json")
         cases = [

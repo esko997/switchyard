@@ -41,6 +41,7 @@ def document_sha256(document):
 def definition_bundle(definition, *, revision, provenance):
     """A validated definition as the normalized Bundle document stored for an observed workload."""
     identities = [{"scope": b["scope"], "backend": b["backend"], "role": b["role"], **b["selector"]} for b in definition["bindings"]]
+    endpoints = definition.get("endpoints", [])
     document = {
         "apiVersion": spec.API_VERSION, "kind": "Bundle",
         "applications": [{
@@ -49,6 +50,8 @@ def definition_bundle(definition, *, revision, provenance):
             "components": [{"id": COMPONENT, "native": {"kind": "observed", "backend": definition["backend"],
                                                          "resource_kind": definition["kind"],
                                                          "runtime": deepcopy(definition["runtime"])}}],
+            "endpoints": [{"id": e["id"], "component": COMPONENT, "protocol": "tcp",
+                           "target_port": e["port"], "scheme": e["scheme"]} for e in endpoints],
             "requires": [{"name": item} for item in definition["requirements"]]
                         + [{"name": ARCHITECTURE_PREFIX + item} for item in definition["architectures"]],
             "notes": {"text": definition["notes"], "health": definition["health_check"],
@@ -60,6 +63,7 @@ def definition_bundle(definition, *, revision, provenance):
             "apiVersion": spec.API_VERSION, "kind": "Placement", "id": definition["id"], "application_id": definition["id"],
             "revision": revision, "host_id": definition["device_id"], "generation": 1, "state": "declared",
             "ownership": "adopted", "components": [{"component": COMPONENT, "native_identities": identities}],
+            "endpoints": [{"endpoint": e["id"], "address": e["address"], "host_port": e["port"]} for e in endpoints],
             "migration_recipe": deepcopy(definition["recipe"]),
         }],
     }
@@ -75,6 +79,9 @@ def bundle_definition(bundle):
     native = application["components"][0]["native"]
     notes = application.get("notes") or {}
     requires = [item["name"] for item in application.get("requires", [])]
+    schemes = {e["id"]: e["scheme"] for e in application.get("endpoints", []) if e.get("scheme")}
+    endpoints = [{"id": e["endpoint"], "address": e["address"], "port": e["host_port"], "scheme": schemes[e["endpoint"]]}
+                 for e in placement.get("endpoints", []) if e["endpoint"] in schemes]
     bindings = []
     for identity in placement["components"][0]["native_identities"]:
         selector = {"name": identity["name"]} if identity.get("name") is not None else {"native_id": identity["native_id"]}
@@ -89,6 +96,7 @@ def bundle_definition(bundle):
         "health_check": notes.get("health"), "data_locations": list(notes.get("data_locations", [])),
         "dependencies": list(notes.get("workload_dependencies", [])),
         "supported_operations": ["observe", "plan-migration"], "runtime": deepcopy(native.get("runtime")),
+        **({"endpoints": endpoints} if endpoints else {}),
     }
 
 

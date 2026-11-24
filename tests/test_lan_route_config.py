@@ -54,11 +54,23 @@ def deployed(instance_id, *, host_id="host-e", state="active", address="192.168.
     return instance, placement
 
 
+def declared(workload_id, *, relation="registered", scheme="http", address="192.168.50.233", port=8080,
+             host_id="host-b", endpoint_id="web", revision=1):
+    return {"id": workload_id, "relation": relation, "data": {
+        "applications": [{"id": workload_id, "revision": revision,
+                          "components": [{"id": "main", "native": {"kind": "observed", "resource_kind": "service"}}],
+                          "endpoints": [{"id": endpoint_id, "component": "main", "protocol": "tcp", "scheme": scheme}]}],
+        "placements": [{"id": workload_id, "application_id": workload_id, "revision": revision,
+                        "host_id": host_id, "state": "declared", "ownership": "adopted",
+                        "endpoints": [{"endpoint": endpoint_id, "address": address, "host_port": port}]}]}}
+
+
 class FakeStore:
     """The WorkloadStore read interface endpoint_scan uses (one snapshot, static methods taking `db`)."""
 
-    def __init__(self, observed_records=(), instances=(), claims=None):
+    def __init__(self, observed_records=(), instances=(), claims=None, registered_records=()):
         self.observed = {item["id"]: item for item in observed_records}
+        self.registered = {item["id"]: item for item in registered_records}
         self.instances = {instance["id"]: (instance, placement) for instance, placement in instances}
         self.claims = claims or {}
         self.reads = 0
@@ -72,6 +84,8 @@ class FakeStore:
         assert db == "db"
         if relation == "observed":
             return list(self.observed.values())
+        if relation == "registered":
+            return list(self.registered.values())
         if relation == "deployed":
             return [{"id": key, "relation": "deployed"} for key in sorted(self.instances)]
         raise AssertionError(relation)
@@ -79,6 +93,8 @@ class FakeStore:
     def relation_of(self, db, workload_id):
         if workload_id in self.observed:
             return "observed"
+        if workload_id in self.registered:
+            return "registered"
         return "deployed" if workload_id in self.instances else None
 
     def instance_row(self, db, instance_id):
@@ -113,7 +129,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([e["ca_file"] for e in config["observed_endpoints"]], ["learning-box-ca.crt", None, None, None])
         minimal = lrc.normalize({"gateway_id": "lan-web", "dns_id": "lan-dns", "zone": "example.test", "ca_sha256": CA})
         self.assertEqual(minimal, {"gateway_id": "lan-web", "dns_id": "lan-dns", "zone": "example.test", "gateway_ip": None,
-                                   "ca_sha256": CA, "adopt_caddy_sha256": None, "adopt_routes": [], "observed_endpoints": []})
+                                   "ca_sha256": CA, "adopt_caddy_sha256": None, "adopt_routes": [],
+                                   "observed_endpoints": [], "upstream_policies": []})
 
     def test_refuses_unknown_keys_bad_values_and_injection(self):
         def endpoint(**changes):
@@ -166,6 +183,22 @@ class ConfigTests(unittest.TestCase):
                 lrc.load(path)
             with self.assertRaises(FileNotFoundError):  # unconfigured, not an error
                 lrc.load(Path(directory) / "missing.json")
+
+    def test_upstream_policies_are_scoped_and_never_redeclare_targets(self):
+        policy = {"workload_id": "web", "endpoint_id": "https", "profile": "verified-https",
+                  "ca_file": "web-ca.pem", "hostnames": ["web.example.test"]}
+        config = lrc.normalize(document(upstream_policies=[policy]))
+        self.assertEqual(config["upstream_policies"], [policy])
+        bad = [None, [policy, policy], [{**policy, "address": "192.168.50.233"}], [{**policy, "port": 443}],
+               [{**policy, "scheme": "https"}], [{k: v for k, v in policy.items() if k != "ca_file"}],
+               [{**policy, "ca_file": "../web.pem"}], [{**policy, "profile": "plain"}],
+               [{**policy, "profile": "unknown"}], [{**policy, "hostnames": []}],
+               [{**policy, "hostnames": ["web.other.test"]}],
+               [{**policy, "hostnames": ["web.example.test"] * 2}],
+               [{"workload_id": "usenet", "endpoint_id": "mylar", "profile": "plain"}]]
+        for policies in bad:
+            with self.subTest(policies=policies), self.assertRaises(ValueError):
+                lrc.normalize(document(upstream_policies=policies))
 
 
 class CandidateTests(unittest.TestCase):
@@ -228,6 +261,98 @@ class CandidateTests(unittest.TestCase):
         rows, skipped = lrc.endpoint_scan(standard_store(claims=claims), self.config)
         self.assertEqual(skipped, [])  # another host's wildcard and an unplaced plan claim block nothing
 
+    def test_declared_endpoints_offer_observed_registered_and_deployed_without_health_checks(self):
+        instance, placement = deployed("deployed-web", check=None)
+        instance["application"]["endpoints"][0]["scheme"] = "http"
+        records = [declared("registered-web", revision=2), declared("observed-web", relation="observed", port=8081)]
+        # Historical applications must not override the revision bound to the placement.
+        historical = deepcopy(records[0]["data"]["applications"][0])
+        historical["revision"] = 1
+        historical["endpoints"][0]["scheme"] = "https"
+        records[0]["data"]["applications"].append(historical)
+        store = FakeStore([records[1]], [(instance, placement)], registered_records=[records[0]])
+        before = deepcopy((store.observed, store.registered, store.instances))
+        config = lrc.normalize(document(observed_endpoints=[]))
+        hosts = [{"id": "host-b", "collector": {"transport": "ssh", "target": "operator@192.168.50.233"}}]
+        rows, skipped = lrc.endpoint_scan(store, config, hosts=hosts)
+        self.assertEqual([(r["workload_id"], r["relation"], r["scheme"]) for r in rows],
+                         [("deployed-web", "deployed", "http"), ("observed-web", "observed", "http"),
+                          ("registered-web", "registered", "http")])
+        self.assertEqual(skipped, [])
+        self.assertEqual(store.reads, 1)
+        self.assertEqual((store.observed, store.registered, store.instances), before)
+
+    def test_adopted_declarations_exclude_ambiguous_unsafe_and_control_plane_targets(self):
+        records = {key: declared(key) for key in ("ambiguous", "wild", "public", "udp", "owned", "job",
+                                                 "registry", "missing-host", "retired", "unclaimed", "lan-web")}
+        ambiguous = records["ambiguous"]["data"]["placements"]
+        ambiguous.append({**deepcopy(ambiguous[0]), "id": "second", "host_id": "other"})
+        records["wild"]["data"]["placements"][0]["endpoints"][0]["address"] = "0.0.0.0"
+        records["public"]["data"]["placements"][0]["endpoints"][0]["address"] = "8.8.8.8"
+        records["udp"]["data"]["applications"][0]["endpoints"][0]["protocol"] = "udp"
+        records["owned"]["data"]["placements"][0]["ownership"] = "managed"
+        records["job"]["data"]["applications"][0]["components"][0]["native"]["resource_kind"] = "scheduled-job"
+        records["registry"]["data"]["placements"][0]["endpoints"][0]["address"] = "192.168.50.234"
+        records["missing-host"]["data"]["placements"][0]["host_id"] = "unknown"
+        records["retired"]["data"]["placements"][0]["state"] = "retired"
+        records["unclaimed"]["data"]["placements"][0]["endpoints"] = []
+        store = FakeStore(registered_records=list(records.values()))
+        hosts = [{"id": "host-b", "collector": {"transport": "ssh", "target": "operator@192.168.50.233"}}]
+        rows, skipped = lrc.endpoint_scan(store, lrc.normalize(document(observed_endpoints=[])), hosts=hosts)
+        self.assertEqual(rows, [])
+        reasons = {r["workload_id"]: r["reason"] for r in skipped}
+        for key, text in {"ambiguous": "multiple current placements", "wild": "exact private", "public": "exact private",
+                          "udp": "not a TCP", "owned": "not adopted", "job": "not a service",
+                          "registry": "registry address", "missing-host": "no LAN address"}.items():
+            self.assertIn(text, reasons[key])
+        self.assertEqual(set(reasons), set(records) - {"retired", "unclaimed", "lan-web"})
+
+        # Even identical addresses on two placements are ambiguous; retired history is not.
+        record = declared("web")
+        second = {**deepcopy(record["data"]["placements"][0]), "id": "second"}
+        record["data"]["placements"].append(second)
+        config = lrc.normalize(document(observed_endpoints=[]))
+        self.assertIn("ambiguous", lrc.endpoint_scan(FakeStore(registered_records=[record]), config)[1][0]["reason"])
+        second["state"] = "retired"
+        self.assertEqual(len(lrc.endpoint_candidates(FakeStore(registered_records=[record]), config)), 1)
+        store = FakeStore(registered_records=[record], claims={"lan-web": [claim("host-b", "0.0.0.0", 8080)]})
+        self.assertIn("gateway or DNS", lrc.endpoint_scan(store, config)[1][0]["reason"])
+
+    def test_legacy_matching_declaration_keeps_policy_and_conflicts_fail_closed(self):
+        baseline = lrc.endpoint_candidates(standard_store(), self.config)
+        store = standard_store()
+        record = declared("learning-box", relation="observed", endpoint_id="https", scheme="https", port=8443)
+        store.observed["learning-box"] = record
+        self.assertEqual(lrc.endpoint_candidates(store, self.config), baseline)
+        for field, value in (("address", "192.168.50.234"), ("host_port", 8444), ("scheme", "http")):
+            changed = deepcopy(record)
+            target = (changed["data"]["applications"][0]["endpoints"][0] if field == "scheme"
+                      else changed["data"]["placements"][0]["endpoints"][0])
+            target[field] = value
+            store.observed["learning-box"] = changed
+            rows, skipped = lrc.endpoint_scan(store, self.config)
+            self.assertNotIn("learning-box", [r["workload_id"] for r in rows])
+            self.assertIn("conflicts with legacy", skipped[0]["reason"])
+
+    def test_https_policy_and_unambiguous_health_declaration_fallback(self):
+        record = declared("web", scheme="https")
+        config = lrc.normalize(document(observed_endpoints=[]))
+        store = FakeStore(registered_records=[record])
+        self.assertIn("CA file", lrc.endpoint_scan(store, config)[1][0]["reason"])
+        policy = {"workload_id": "web", "endpoint_id": "web", "profile": "verified-https", "ca_file": "web-ca.crt"}
+        secure = lrc.normalize(document(observed_endpoints=[], upstream_policies=[policy]))
+        self.assertEqual(lrc.endpoint_candidates(store, secure)[0]["ca_file"], "web-ca.crt")
+        wrong = lrc.normalize(document(observed_endpoints=[], upstream_policies=[{**policy, "profile": "plain", "ca_file": None}]))
+        self.assertIn("does not match", lrc.endpoint_scan(store, wrong)[1][0]["reason"])
+        app = record["data"]["applications"][0]
+        del app["endpoints"][0]["scheme"]
+        app["health_checks"] = [{"type": "http", "endpoint": "web", "scheme": "https"}]
+        self.assertEqual(lrc.endpoint_candidates(store, secure)[0]["scheme"], "https")
+        app["health_checks"].append({"type": "http", "endpoint": "web", "scheme": "http"})
+        self.assertIn("unambiguous", lrc.endpoint_scan(store, secure)[1][0]["reason"])
+        app["health_checks"] = [{"type": "http", "endpoint": "web"}] * 2
+        self.assertEqual(lrc.endpoint_candidates(store, config)[0]["scheme"], "http")
+
 
 class RouteTests(unittest.TestCase):
     def setUp(self):
@@ -281,6 +406,23 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(value, hashlib.sha256(text.encode()).hexdigest())
         self.assertNotEqual(value, lrc.probe_value({**item, "port": 3001}))
         self.assertNotEqual(value, lrc.probe_value({**item, "hostname": "talk.example.test"}))
+
+    def test_declared_policy_trust_is_enforced_by_route_snapshots(self):
+        policy = {"workload_id": "web", "endpoint_id": "web", "profile": "verified-https",
+                  "ca_file": "web-ca.pem", "hostnames": ["web.example.test"]}
+        config = lrc.normalize(document(observed_endpoints=[], upstream_policies=[policy]))
+        rows = lrc.endpoint_candidates(FakeStore(registered_records=[declared("web", scheme="https")]), config)
+        item = lrc.route(config, rows, "web", "web", "web")
+        self.assertEqual(lrc.check_route(config, item), item)
+        self.assertEqual(lrc.ca_files(config, [item]), ["web-ca.pem"])
+        for changes in ({"hostname": "other.example.test"}, {"profile": "plain", "scheme": "http"},
+                        {"profile": "rewrite-redirect", "scheme": "http"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                lrc.check_route(config, {**item, **changes})
+        with self.assertRaises(ValueError):
+            lrc.check_route(lrc.normalize(document(observed_endpoints=[])), item)
+        # Policy never pins a target: the route snapshot carries it, and planning checks current candidates.
+        self.assertEqual(lrc.check_route(config, {**item, "port": 8443})["port"], 8443)
 
 
 class RenderTests(unittest.TestCase):
@@ -359,6 +501,36 @@ class RenderTests(unittest.TestCase):
         routes = [{**chat, "hostname": ("h" + str(i)).ljust(63, "x") + ".example.test"} for i in range(lrc.MAX_ROUTES)]
         text = lrc.render(self.config, "192.168.50.233", routes)
         self.assertLessEqual(len(text.encode()), 65536)
+
+    def test_declared_target_policies_preserve_all_legacy_route_bytes(self):
+        data = document(observed_endpoints=[])
+        data["upstream_policies"] = []
+        records = {}
+        for endpoint in self.config["observed_endpoints"]:
+            workload_id = endpoint["workload_id"]
+            if workload_id not in records:
+                record = declared(workload_id, relation="observed")
+                record["data"]["applications"][0]["endpoints"] = []
+                record["data"]["placements"][0]["endpoints"] = []
+                records[workload_id] = record
+            record = records[workload_id]
+            record["data"]["applications"][0]["endpoints"].append({
+                "id": endpoint["endpoint_id"], "component": "main", "protocol": "tcp", "scheme": endpoint["scheme"]})
+            record["data"]["placements"][0]["endpoints"].append({
+                "endpoint": endpoint["endpoint_id"], "address": endpoint["address"], "host_port": endpoint["port"]})
+            data["upstream_policies"].append({key: endpoint[key] for key in
+                                              ("workload_id", "endpoint_id", "profile", "hostnames", "ca_file")})
+        config = lrc.normalize(data)
+        store = FakeStore(records.values(), [deployed("open-webui")])
+        rows, skipped = lrc.endpoint_scan(store, config)
+        self.assertEqual(skipped, [])
+        routes = [lrc.route(config, rows, item["hostname"], item["workload_id"], item["endpoint_id"])
+                  for item in self.routes]
+        self.assertEqual(routes, self.routes)
+        text = lrc.render(config, "192.168.50.233", routes)
+        self.assertEqual(text, lrc.render(self.config, "192.168.50.233", self.routes))
+        self.assertEqual(lrc.ca_files(config, routes), lrc.ca_files(self.config, self.routes))
+        self.assertNotIn("tls_insecure_skip_verify", text)
 
 
 if __name__ == "__main__":

@@ -1,27 +1,20 @@
 """LAN routes: the private route configuration, endpoint candidates and the gateway Caddyfile renderer.
 
-Pure functions, no host access. The operator's private JSON configuration names the gateway (Caddy) and DNS
-instances, the zone, the gateway CA fingerprint, the exact routes to adopt from the hand-written Caddyfile, and the
-observed-service endpoints that may be published (an observed workload declares no endpoints of its own).
+Pure functions, no host access. Endpoints are declared by an application and claimed by its placement; offering
+one as a candidate does not publish it. Legacy observed_endpoints retain their exact configured targets and
+policies. Optional upstream_policies configure only a declared endpoint's proxy profile, allowed hostnames and
+HTTPS CA file, never its address or port.
 
-Endpoint candidates are never discovered automatically: a deployed instance offers an endpoint only when its
-current placement claims it on an exact private IPv4 address over TCP and the application declares an HTTP health
-check on it; an observed workload offers only the endpoints listed in the configuration, after its record, its bound
-host and (with the host registry) that host's address are checked. A route is a resolved snapshot of one candidate
-under one hostname of the zone. The renderer owns the whole Caddyfile (there is no raw editor): the baseline
-global options, internal TLS, the HTTP redirect/CA download listener and the health listener, then one site per
-route. Each site answers `GET /.well-known/switchyard-route` itself with `probe_value(route)`, so the proxy
-configuration is verifiable on the gateway even while the workload behind it is stopped.
+Candidates require an exact private IPv4 TCP claim. Adopted placements must match the host registry when it is
+provided; ambiguous endpoints on multiple current placements are excluded. Older applications may infer the
+scheme from an unambiguous declared HTTP health check (no health-result requirement). HTTPS needs an explicitly
+configured verified-https policy and CA file; TLS verification is never bypassed.
 
-Upstream profiles are generic and come only from the trusted configuration (observed endpoints); deployed
-endpoints are always `plain`:
-- `plain`: HTTP reverse proxy;
-- `rewrite-redirect`: HTTP; `Location` headers naming the exact upstream or the route hostname over plain HTTP are
-  rewritten to the route's HTTPS URL (for applications that redirect to their own address);
-- `verified-https`: HTTPS upstream trusting only the endpoint's `ca_file`, a CA certificate the gateway carries as
-  a configuration file (mounted at `/etc/caddy/<ca_file>`; `ca_files()` lists those the routes need).
-Any observed endpoint may restrict the hostnames it is published under (`hostnames`), for applications that
-refuse unknown Host headers (SABnzbd's `host_whitelist`): adding a name there also needs that application setting.
+A route is a resolved snapshot under one hostname. The renderer owns the whole Caddyfile, including the baseline
+listeners and a gateway-answered route marker, so configuration remains verifiable while its backend is stopped.
+Profiles are plain HTTP, rewrite-redirect HTTP (rewriting exact upstream/plain-route Location headers), or
+verified-https (trusting only the configured CA file mounted under /etc/caddy). Hostname restrictions apply to
+every profile.
 """
 import hashlib
 from ipaddress import IPv4Address, IPv4Network
@@ -52,7 +45,7 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CA_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\.[A-Za-z0-9_-]{1,32})*\.(?:crt|pem)\Z")
 _LAN = (IPv4Network("10.0.0.0/8"), IPv4Network("172.16.0.0/12"), IPv4Network("192.168.0.0/16"))
 _CONFIG_KEYS = {"gateway_id", "dns_id", "zone", "ca_sha256"}
-_CONFIG_OPTIONAL = {"gateway_ip", "adopt_caddy_sha256", "adopt_routes", "observed_endpoints"}
+_CONFIG_OPTIONAL = {"gateway_ip", "adopt_caddy_sha256", "adopt_routes", "observed_endpoints", "upstream_policies"}
 _OBSERVED_KEYS = {"workload_id", "endpoint_id", "host_id", "address", "port", "scheme", "profile"}
 
 
@@ -189,6 +182,44 @@ def normalize(data):
         observed.append(entry)
     config["observed_endpoints"] = sorted(observed, key=lambda e: (e["workload_id"], e["endpoint_id"]))
 
+    policies, policy_keys = [], set()
+    items = data.get("upstream_policies", [])
+    if not isinstance(items, list) or len(items) > MAX_ENDPOINTS:
+        raise ValueError("upstream_policies must be a list of at most " + str(MAX_ENDPOINTS))
+    for item in items:
+        _exact_keys(item, {"workload_id", "endpoint_id", "profile"}, {"hostnames", "ca_file"}, "upstream policy")
+        entry = {"workload_id": _identifier(item["workload_id"], "upstream policy workload_id"),
+                 "endpoint_id": _identifier(item["endpoint_id"], "upstream policy endpoint_id"),
+                 "profile": item["profile"]}
+        label = entry["workload_id"] + "/" + entry["endpoint_id"]
+        key = (entry["workload_id"], entry["endpoint_id"])
+        if key in policy_keys:
+            raise ValueError("Duplicate upstream policy " + label)
+        if key in keys:
+            raise ValueError("Upstream policy " + label + " overlaps a legacy observed endpoint policy")
+        if entry["workload_id"] in (gateway_id, dns_id):
+            raise ValueError("Upstream policy " + label + " names the gateway or DNS instance")
+        policy_keys.add(key)
+        if not isinstance(entry["profile"], str) or entry["profile"] not in PROFILES:
+            raise ValueError("Invalid upstream policy " + label + " profile")
+        hostnames = item.get("hostnames")
+        if hostnames is not None:
+            if not isinstance(hostnames, list) or not 0 < len(hostnames) <= MAX_HOSTNAMES:
+                raise ValueError("Upstream policy " + label + " hostnames must be a list of 1-" + str(MAX_HOSTNAMES))
+            hostnames = [_zone_name(zone, name, "upstream policy " + label + " hostname") for name in hostnames]
+            if len(set(hostnames)) != len(hostnames):
+                raise ValueError("Duplicate hostname for upstream policy " + label)
+            hostnames = sorted(hostnames)
+        entry["hostnames"] = hostnames
+        ca_file = item.get("ca_file")
+        if (ca_file is not None) != (entry["profile"] == "verified-https"):
+            raise ValueError("Upstream policy " + label + ": ca_file is required for verified-https and only there")
+        if ca_file is not None and (not isinstance(ca_file, str) or not _CA_FILE.match(ca_file)):
+            raise ValueError("Upstream policy " + label + ": ca_file must be a plain .crt or .pem file name")
+        entry["ca_file"] = ca_file
+        policies.append(entry)
+    config["upstream_policies"] = sorted(policies, key=lambda e: (e["workload_id"], e["endpoint_id"]))
+
     adopt, names = [], set()
     items = data.get("adopt_routes", [])
     if not isinstance(items, list) or len(items) > MAX_ROUTES:
@@ -264,45 +295,53 @@ def _overlaps(blocked, host_id, address, port):
 
 
 def endpoint_scan(store, config, *, hosts=None):
-    """Candidate rows and the configured or deployed endpoints left out (with the reason), from one store snapshot.
+    """Candidates and exclusions from one read-only store snapshot; no probes or health results are needed.
 
-    `hosts`: the host registry's records; when given, an observed endpoint's address must be its bound host's
-    registry (SSH target) address."""
-    rows, skipped = [], []
-    registry = None
-    if hosts is not None:
-        registry = {entry["host_id"]: entry["address"] for entry in registry_addresses(hosts)[0]}
+    When `hosts` is provided, adopted endpoints must match their bound host's registry SSH address."""
+    rows, skipped, declared = [], [], {}
+    registry = None if hosts is None else {entry["host_id"]: entry["address"] for entry in registry_addresses(hosts)[0]}
+    policies = {(e["workload_id"], e["endpoint_id"]): e for e in config.get("upstream_policies", [])}
     with store.reading() as db:
         blocked = set()
         for instance_id in (config["gateway_id"], config["dns_id"]):
             blocked |= _blocked(row for row in store.claims_for(db, instance_id) if row.get("owner_kind") == "placement")
         observed = {record["id"]: record for record in store.records(db, "observed")}
-        deployed = [record["id"] for record in store.records(db, "deployed")]
-        for entry in config["observed_endpoints"]:
-            reason = _observed_refusal(entry, observed.get(entry["workload_id"]), registry, store.relation_of(db, entry["workload_id"]))
-            if reason is None and _overlaps(blocked, entry["host_id"], entry["address"], entry["port"]):
-                reason = "the gateway or DNS instance holds " + entry["address"] + ":" + str(entry["port"])
+        for record in list(observed.values()) + store.records(db, "registered"):
+            if record["id"] not in (config["gateway_id"], config["dns_id"]):
+                for row, reason in _bundle_rows(record, registry):
+                    declared.setdefault((row["workload_id"], row["endpoint_id"]), []).append((row, reason))
+        for record in store.records(db, "deployed"):
+            if record["id"] in (config["gateway_id"], config["dns_id"]):
+                continue
+            for row, reason in _deployed_rows(store.instance_row(db, record["id"]), store.placement_row(db, record["id"])):
+                declared.setdefault((row["workload_id"], row["endpoint_id"]), []).append((row, reason))
+        legacy = {(e["workload_id"], e["endpoint_id"]): e for e in config["observed_endpoints"]}
+        for key in sorted(set(declared) | set(legacy)):
+            entries = declared.get(key, [])
+            entry = legacy.get(key)
+            if len(entries) > 1:
+                row, reason = entries[0][0], "endpoint is ambiguous across multiple current placements"
+            elif entries:
+                row, reason = entries[0]
+                if entry is not None and any(row[k] != entry[k] for k in ("address", "port", "scheme")):
+                    reason = "declared endpoint conflicts with legacy observed endpoint address, port or scheme"
+            else:
+                row = {k: entry[k] for k in ("workload_id", "endpoint_id", "address", "port", "scheme", "profile",
+                                             "host_id", "hostnames", "ca_file")} | {"relation": "observed"}
+                reason = _observed_refusal(entry, observed.get(key[0]), registry, store.relation_of(db, key[0]))
+            policy = entry if entry is not None else policies.get(key)
+            if policy is not None:
+                row = {**row, **{k: policy[k] for k in ("profile", "hostnames", "ca_file")}}
+                if reason is None and PROFILES[row["profile"]] != row["scheme"]:
+                    reason = "upstream policy profile does not match the declared endpoint scheme"
+            elif reason is None and row["scheme"] == "https":
+                reason = "HTTPS endpoint needs a verified-https upstream policy with a CA file"
+            if reason is None and _overlaps(blocked, row["host_id"], row["address"], row["port"]):
+                reason = "the gateway or DNS instance holds " + row["address"] + ":" + str(row["port"])
             if reason:
-                skipped.append({"workload_id": entry["workload_id"], "endpoint_id": entry["endpoint_id"], "reason": reason})
-                continue
-            rows.append({key: entry[key] for key in ("workload_id", "endpoint_id", "address", "port", "scheme", "profile",
-                                                       "host_id", "hostnames", "ca_file")} | {"relation": "observed"})
-        for instance_id in deployed:
-            if instance_id in (config["gateway_id"], config["dns_id"]):
-                continue
-            instance = store.instance_row(db, instance_id)
-            placement = store.placement_row(db, instance_id)
-            for row, reason in _deployed_rows(instance, placement):
-                if reason is None and _overlaps(blocked, row["host_id"], row["address"], row["port"]):
-                    reason = "the gateway or DNS instance holds " + row["address"] + ":" + str(row["port"])
-                if reason:
-                    skipped.append({"workload_id": instance_id, "endpoint_id": row["endpoint_id"], "reason": reason})
-                else:
-                    rows.append(row)
-    rows.sort(key=lambda r: (r["workload_id"], r["endpoint_id"]))
-    keys = [(r["workload_id"], r["endpoint_id"]) for r in rows]
-    if len(set(keys)) != len(keys):  # an observed and a deployed workload cannot share an ID; fail closed anyway
-        raise ValueError("Duplicate endpoint candidates")
+                skipped.append({"workload_id": key[0], "endpoint_id": key[1], "reason": reason})
+            else:
+                rows.append(row)
     return rows, skipped
 
 
@@ -334,37 +373,66 @@ def _observed_refusal(entry, record, registry, relation):
     return None
 
 
-def _deployed_rows(instance, placement):
-    """(row, refusal) for each declared endpoint of a placed deployed instance; nothing for unplaced ones."""
-    if instance is None or placement is None or placement["state"] not in DEPLOYED_STATES:
-        return []
-    if placement["meta"].get("uncertain"):
-        return [(row, "its placement's effects are uncertain; inspect it first") for row, _ in
-                _deployed_rows(instance, {**placement, "meta": {}})]
-    app = instance["application"]
-    checked = {check["endpoint"] for check in app.get("health_checks", [])
-               if check.get("type") == "http" and check.get("scheme", "http") == "http"}
-    claims = {claim["endpoint"]: claim for claim in placement["placement"].get("endpoints", [])}
+def _endpoint_rows(workload_id, relation, app, placement, *, registry=None, refusal=None):
+    """Resolve declarations against exact claims, leaving policy selection to endpoint_scan."""
+    claims = {claim["endpoint"]: claim for claim in placement.get("endpoints", [])}
+    components = {component["id"]: component["native"] for component in app.get("components", [])}
     result = []
     for endpoint in app.get("endpoints", []):
         claim = claims.get(endpoint["id"])
         if claim is None:
             continue
-        row = {"workload_id": instance["id"], "endpoint_id": endpoint["id"], "address": claim["address"],
-               "port": claim["host_port"], "scheme": "http", "profile": "plain", "host_id": placement["host_id"],
-               "relation": "deployed", "hostnames": None, "ca_file": None}
-        reason = None
-        if endpoint["protocol"] != "tcp":
+        schemes = {check.get("scheme", "http") for check in app.get("health_checks", [])
+                   if check.get("type") == "http" and check.get("endpoint") == endpoint["id"]}
+        scheme = endpoint.get("scheme") or (next(iter(schemes)) if len(schemes) == 1 else None)
+        row = {"workload_id": workload_id, "endpoint_id": endpoint["id"], "address": claim["address"],
+               "port": claim["host_port"], "scheme": scheme, "profile": "plain", "host_id": placement["host_id"],
+               "relation": relation, "hostnames": None, "ca_file": None}
+        native = components.get(endpoint.get("component"), {})
+        reason = refusal
+        if reason is None and endpoint["protocol"] != "tcp":
             reason = "not a TCP endpoint"
-        elif endpoint["id"] not in checked:
-            reason = "no HTTP health check declared on this endpoint"
-        else:
+        if reason is None and scheme not in ("http", "https"):
+            reason = "no HTTP scheme or unambiguous HTTP health check declared on this endpoint"
+        if reason is None and native.get("kind") == "observed" and native.get("resource_kind", "service") != "service":
+            reason = "observed endpoint is not a service"
+        if reason is None:
             try:
                 lan_address(claim["address"], "claim address")
             except ValueError:
                 reason = "claimed on " + str(claim["address"]) + ", not an exact private LAN IPv4 address"
+        if reason is None and registry is not None:
+            address = registry.get(placement["host_id"])
+            if address is None:
+                reason = "host " + placement["host_id"] + " has no LAN address in the registry"
+            elif address != claim["address"]:
+                reason = "host " + placement["host_id"] + " has registry address " + address + ", not " + claim["address"]
         result.append((row, reason))
     return result
+
+
+def _bundle_rows(record, registry):
+    bundle = record["data"]
+    applications = {(app["id"], app.get("revision")): app for app in bundle.get("applications", [])}
+    result = []
+    for placement in bundle.get("placements", []):
+        if placement.get("state") == "retired":
+            continue
+        app = applications.get((placement.get("application_id"), placement.get("revision")))
+        if app is None:
+            continue
+        refusal = None if placement.get("ownership") == "adopted" else "placement is not adopted"
+        result.extend(_endpoint_rows(record["id"], record["relation"], app, placement, registry=registry, refusal=refusal))
+    return result
+
+
+def _deployed_rows(instance, placement):
+    """Declared endpoints of the current placed generation, including stopped/fenced backends."""
+    if instance is None or placement is None or placement["state"] not in DEPLOYED_STATES:
+        return []
+    refusal = "its placement's effects are uncertain; inspect it first" if placement["meta"].get("uncertain") else None
+    return _endpoint_rows(instance["id"], "deployed", instance["application"],
+                          {**placement["placement"], "host_id": placement["host_id"]}, refusal=refusal)
 
 
 # ----------------------------------------------------------------------------------------------- routes
@@ -386,7 +454,7 @@ def route(config, candidates, hostname, workload_id, endpoint_id):
 
 
 def _resolve(config, item, gateway_ip=None):
-    """(snapshot, configured observed endpoint or None) of one validated route."""
+    """(snapshot, configured endpoint policy or None) of one validated route."""
     if not isinstance(item, dict) or not set(ROUTE_KEYS) <= set(item):
         raise ValueError("Route needs " + ", ".join(ROUTE_KEYS))
     snapshot = {key: item[key] for key in ROUTE_KEYS}
@@ -399,13 +467,16 @@ def _resolve(config, item, gateway_ip=None):
     lan_address(snapshot["address"], "route " + label + " address")
     _port(snapshot["port"], "route " + label + " port")
     _check_target(snapshot["profile"], snapshot["scheme"], "route " + label)
-    trusted = next((e for e in config["observed_endpoints"] if (e["workload_id"], e["endpoint_id"]) ==
-                    (snapshot["workload_id"], snapshot["endpoint_id"])), None)
+    key = (snapshot["workload_id"], snapshot["endpoint_id"])
+    legacy = next((e for e in config["observed_endpoints"] if (e["workload_id"], e["endpoint_id"]) == key), None)
+    trusted = legacy or next((e for e in config.get("upstream_policies", [])
+                              if (e["workload_id"], e["endpoint_id"]) == key), None)
     if trusted is None and snapshot["profile"] != "plain":
-        raise ValueError("Route " + label + ": profile " + snapshot["profile"] + " comes only from a configured observed endpoint")
+        raise ValueError("Route " + label + ": profile " + snapshot["profile"] + " needs a configured upstream policy")
     if trusted is not None:
-        if any(trusted[key] != snapshot[key] for key in ("address", "port", "scheme", "profile")):
-            raise ValueError("Route " + label + " no longer matches its configured endpoint")
+        fields = ("address", "port", "scheme", "profile") if legacy is not None else ("profile",)
+        if any(trusted[k] != snapshot[k] for k in fields):
+            raise ValueError("Route " + label + " no longer matches its configured endpoint policy")
         if trusted["hostnames"] is not None and label not in trusted["hostnames"]:
             raise ValueError("Route " + label + " is not an allowed hostname of its endpoint")
     if gateway_ip is not None and snapshot["address"] == gateway_ip and snapshot["port"] in (80, 443):

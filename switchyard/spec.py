@@ -590,6 +590,13 @@ class Endpoint(Model):
     protocol: Literal["tcp", "udp"]
     target_port: Port
     consumers: list[Text] = Field(default_factory=list)
+    scheme: Literal["http", "https"] | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def web_transport(self):
+        if self.scheme is not None and self.protocol != "tcp":
+            raise ValueError("HTTP/HTTPS endpoint requires TCP")
+        return self
 
 
 class Capacity(Model):
@@ -941,6 +948,8 @@ class Application(Model):
                     raise ValueError("check endpoint belongs to a different component")
                 if endpoints[check.endpoint].protocol != "tcp":
                     raise ValueError("HTTP/TCP checks require a TCP endpoint")
+                if isinstance(check, HTTPCheck) and endpoints[check.endpoint].scheme not in (None, check.scheme):
+                    raise ValueError("HTTP check scheme does not match its endpoint")
             if isinstance(check, DNSCheck):
                 _refs([check.endpoint], endpoints, "check endpoint")
                 if endpoints[check.endpoint].component != check.component:
