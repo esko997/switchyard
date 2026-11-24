@@ -185,4 +185,8 @@ Tests use isolated fixtures and temporary ledgers. A test run is not evidence th
 uv run --locked python -m unittest discover -s tests -v
 ```
 
-The UI has no frontend build step or external font request. Bundled Big Shoulders and Source Sans 3 retain their attribution and license texts in [FONT-LICENSES.txt](switchyard/static/FONT-LICENSES.txt). No project license is selected by this snapshot.
+## License
+
+Switchyard is licensed under the [GNU General Public License](LICENSE), version 3 or (at your option) any later version (`GPL-3.0-or-later`).
+
+The UI has no frontend build step or external font request. The bundled Big Shoulders and Source Sans 3 font files remain separately licensed under the SIL Open Font License 1.1; see [FONT-LICENSES.txt](switchyard/static/FONT-LICENSES.txt).
