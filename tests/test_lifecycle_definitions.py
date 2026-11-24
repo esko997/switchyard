@@ -24,7 +24,6 @@ class LifecycleDefinitionTests(unittest.TestCase):
         self.operations_path = self.root / "operations.json"
         self.collectors_path = self.root / "collectors.json"
         self.ledger = self.root / "source.ledger"
-        self.ledger.write_text("isolated fixture\n")
         self.host = {"host_id": "source", "transport": "ssh", "target": "fixture@source.invalid",
                      "expected_hostname": "source", "ledger": str(self.ledger), "user_units": [], "system_units": []}
         self.collectors_path.write_text(json.dumps({"schema_version": 1, "hosts": [self.host]}))
@@ -68,6 +67,7 @@ class LifecycleDefinitionTests(unittest.TestCase):
 
     def dispatch(self, receipt, payload):
         payload = {**payload, "operation_id": receipt["id"], "state_dir": str(self.service._broker.store.directory),
+                   "lease_state_dir": str(self.service._broker.lease_state_dir),
                    "hosts": {"source": self.host}}
         with patch.object(operation_worker.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(encode(payload).encode()))), \
                 patch.object(operation_worker.signal, "signal"), redirect_stdout(io.StringIO()):

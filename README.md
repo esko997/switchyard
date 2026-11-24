@@ -53,21 +53,20 @@ The catalog's hosts and workloads seed private databases once. Afterwards the ho
 
 State defaults below the XDG state root (`~/.local/state/switchyard` without an override); `--state-dir` selects another private directory. Use the same catalog, state and configuration for web, CLI and MCP consumers.
 
-### Canonical device ledgers
+### Device lease authority
 
-Every registry host has one canonical ledger on the control host. The default root is:
+The control host's private state directory holds one `leases/leases.sqlite3`
+for the whole fleet. A lease coordinates access; it does not authorize an
+operation or fence a disconnected actor.
 
-```sh
-${XDG_STATE_HOME:-$HOME/.local/state}/switchyard/ledgers
-```
-
-`SWITCHYARD_LEDGER_DIR` overrides that root. Ledger names are `DEVICE_ACCESS_<LABEL>.md`, where the host ID is uppercased and non-alphanumeric characters removed: `host-a` becomes `DEVICE_ACCESS_HOSTA.md`. `host-add` creates a missing ledger; leasing never creates one. Linux collectors can also use an explicitly configured existing canonical absolute ledger path. Replace the placeholder paths in `collectors.example.json` before use.
-
-Keep ledgers outside checkouts and use the same canonical inode for every caller. Never replace, rename or atomically rewrite a ledger; records are append-only. A lease coordinates access, but does not authorize an operation or fence a disconnected actor.
+Collector `ledger` paths remain resource-label hints for existing configurations.
+For example, `DEVICE_ACCESS_HOSTA.md` maps to the same reservation as host ID
+`host-a`. No such file needs to exist. Existing installations must follow
+the [offline lease migration](docs/access.md#migrating-an-existing-authority).
 
 ### Enable observation
 
-Edit the collector seed **before its first use**, or update an already-seeded host through the host registry. Supply the real SSH account/address, expected hostname, existing trusted host keys, canonical ledger, and exact unit/runtime allowlists. The example addresses are documentation addresses, not endpoints to use.
+Edit the collector seed **before its first use**, or update an already-seeded host through the host registry. Supply the real SSH account/address, expected hostname, existing trusted host keys, resource label, and exact unit/runtime allowlists. The example addresses are documentation addresses, not endpoints to use.
 
 ```sh
 uv run --locked switchyard --catalog catalogs/home-lab.json \
@@ -136,7 +135,7 @@ Structured operations use inspection → expiring plan → explicit approval and
 
 ## Agent device leases
 
-Use the same control host and canonical ledgers for all device access:
+Use the same control host and state directory for all device access:
 
 ```sh
 switchyard lease run source --scope "inspect service" -- sh -c 'ssh "$SWITCHYARD_SSH_TARGET" uname -n'
@@ -146,9 +145,9 @@ switchyard lease status source
 switchyard lease list --json
 ```
 
-`run` holds the lease for the command and exports connection metadata. `hold` uses a systemd user holder, with a default 60-minute TTL and maximum 120 minutes; release as soon as work finishes. Busy, suspect or blocked devices are not permission to bypass coordination. Human-only `lease break`/`clear` requires confirming the old operation stopped. Do not hold device leases while building artifacts. See [access](docs/access.md) and [remote agents](docs/remote-agents.md).
+`run` keeps the lease for the command and exports connection metadata. After a `hold`, release the exact ID as soon as completion is confirmed. Deadlines default to 60 minutes (maximum 120); missed deadlines do not free the device. For suspect or blocked devices, the operator must inspect the target before attesting that work stopped. Never hold device leases while building. See [access](docs/access.md) and [remote agents](docs/remote-agents.md).
 
-`tools/install-agent-cli.sh` installs wrappers using your configuration. `tools/install-services.sh --lan-address ADDRESS --allowed-clients CIDR` can install systemd user services; inspect its options first because it starts listeners and monitoring. Keep the control plane where canonical ledgers and USB devices live. Set `SWITCHYARD_LEDGER_DIR` and Android SDK variables consistently for every process; systemd user services need explicit `Environment=` overrides rather than relying on a shell export.
+`tools/install-agent-cli.sh` installs wrappers using your configuration. `tools/install-services.sh --lan-address ADDRESS --allowed-clients CIDR` can install systemd user services; inspect its options first because it starts listeners and monitoring. Use consistent state and Android SDK settings for native and containerized processes. Systemd user services need explicit `Environment=` overrides rather than shell exports.
 
 ## LAN access
 

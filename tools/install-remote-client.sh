@@ -71,7 +71,7 @@ description: "Use before adb/ssh/network access from {host} to another registry 
 
 # Switchyard device leases from {host}
 
-The fleet's device locks live on the control host (`{control}`): canonical ledgers, kernel `flock` and append-only CLAIM/RELEASE lines. Its ledger directory is `SWITCHYARD_LEDGER_DIR`, or `switchyard/ledgers` beneath `XDG_STATE_HOME` (default `~/.local/state`). This host's `~/.local/bin/switchyard` client takes every lease there over SSH, so all callers share the same locks. Never create, edit or `flock` local copies.
+The fleet's device reservations live in Switchyard's SQLite authority on the control host (`{control}`). This host's `~/.local/bin/switchyard` client takes every lease there over SSH. There is no file-lock fallback.
 
 ## When
 
@@ -83,15 +83,15 @@ Before **any** access (even read-only `adb`, `ssh`, network API or file transfer
 switchyard lease run host-a --scope "what and why" -- sh -c 'ssh -o BatchMode=yes "$SWITCHYARD_SSH_TARGET" journalctl --user -n 50'
 ```
 
-The command runs here with `SWITCHYARD_LEASE_ID`, `SWITCHYARD_DEVICE` and the configured `SWITCHYARD_SSH_TARGET`/`SWITCHYARD_SSH_PORT` or `ANDROID_SERIAL`. USB devices attached to the control host are usually unreachable here. The client holds its SSH connection open, heartbeats every 15 seconds and releases only after the command exits. The command dies with the client.
+The command runs here with `SWITCHYARD_LEASE_ID`, `SWITCHYARD_DEVICE` and the configured `SWITCHYARD_SSH_TARGET`/`SWITCHYARD_SSH_PORT` or `ANDROID_SERIAL`. USB devices attached to the control host are usually unreachable here. The client sends heartbeats and confirms completion after a known command exit.
 
 - **75 = busy.** Nothing ran; the message names the holder and scope. Wait boundedly (`--wait 300`, maximum 600) or defer; never bypass.
-- **76 = lease lost mid-command.** The connection dropped, the 120-minute cap expired or an operator released it. The client terminates the command (SIGTERM, then SIGKILL after 10 seconds), waits for exit, then attempts release for up to two minutes. Inspect device state; do not assume completion.
-- **255 = control host unreachable.** Nothing ran. Do not touch the device; report it.
+- **76 = lease lost or completion unconfirmed.** The client stops its local process group and does not automatically release. Inspect the target; local cleanup cannot prove the remote command stopped.
+- **255 = SSH transport failure.** Do not touch the device; report it.
 
 ## Suspect leases (fail-closed)
 
-If the control host loses contact (no heartbeat for 60 seconds or no final "done"), the command's state is unknown. The lock remains held and marked **suspect**, until explicit release or the 120-minute cap. Confirm the command stopped before `switchyard lease release LEASE_ID`; never release another caller's suspect lease without that confirmation.
+If the authority loses contact, misses the deadline, or cannot verify completion, it keeps the reservation **suspect**. A lost attached command requires operator attestation that work stopped.
 
 ## Several separate tool calls
 
@@ -100,13 +100,13 @@ switchyard lease hold host-a --scope "inspect configured service"   # JSON with 
 switchyard lease release LEASE_ID                                  # immediately when done
 ```
 
-Remote holds are TTL-only: default 60 minutes, maximum 120; renew with `switchyard lease renew LEASE_ID --ttl 30m`. The control host cannot see your process exit. Always release promptly; prefer `lease run`. Never hold a device lease while building.
+Remote holds are detached: default deadline 60 minutes, maximum 120; renew with `switchyard lease renew LEASE_ID --ttl 30m`. A missed deadline keeps an unconfirmed reservation. Release promptly after confirming completion; prefer `lease run`. Never hold a device lease while building.
 
 ## Status and other commands
 
 - `switchyard lease status <device>`: exit 0 free, 1 held, 2 unknown; shows the handoff baseline. `switchyard lease list` shows holders.
 - Read-only state: `switchyard hosts`, `switchyard fleet`, `switchyard definitions`, `switchyard operations`.
-- `switchyard mcp` serves cache reads and `lease_hold`, `lease_release`, `lease_renew`; holds are TTL-only and attributed to this host and your Paseo agent.
+- `switchyard mcp` serves cache reads and `lease_hold`, `lease_release`, `lease_renew`; holds are detached and attributed to this host and your Paseo agent.
 - No remote `shell`, operations, registry/definition edits or `--pass-lock-fd`; ask the operator or an agent on the control host.
 - If Switchyard itself fails (not busy), stop and report. There is no local fallback lock.
 '''
@@ -116,9 +116,9 @@ section = f'''## Hardware & Networked Device Locks (Mandatory Across All Repos &
 Before **any** interaction (including read-only adb, SSH, network API or file transfer) from {host} with another Switchyard registry host, take its lease **through Switchyard** (MUST). The locks live on the control host (`{control}`); this host's `~/.local/bin/switchyard` is a remote client. Work on {host} needs no lease unless coordinating with other agents accessing it.
 
 - One command: `switchyard lease run <device> --scope "<what and why>" -- <command...>`; configured connection variables are exported, and the command runs under the lease.
-- Several steps: `switchyard lease hold <device> --scope "..."`, then `switchyard lease release LEASE_ID` immediately when done. Remote holds are TTL-only (60 minutes by default, 120 maximum); always release. Never hold a device lease while building.
+- Several steps: `switchyard lease hold <device> --scope "..."`, then `switchyard lease release LEASE_ID` after confirming completion. A missed deadline makes the hold suspect, not available to another caller. Never hold a device lease while building.
 - Exit 75 means busy; wait boundedly (`--wait` at most 600 seconds) or defer, never bypass. Exit 76 means lease lost and command terminated; inspect before acting again. Exit 255 means control host unreachable; do not touch the device.
-- A suspect lease means command state unknown. Confirm it stopped before explicit release.
+- A suspect lease means command state unknown. Inspect the target; a lost attached command requires operator attestation before the reservation clears.
 - `switchyard lease status <device>` / `switchyard lease list` show holders; `switchyard hosts` lists the registry.
 - No remote shell, operations or `--pass-lock-fd`.
 - If Switchyard fails, stop and report. Never hand-roll local locks or ledger lines; never create, edit or replace local ledger copies.

@@ -30,7 +30,7 @@ import uuid
 from . import ansible_discovery as discovery, host_registry
 from .ansible_runner import (COLLECTION, VERSION, EventStream, Runner, _stdin_pipe, parse_events, parse_records,
                              private_dir, run_process, write_private)
-from .leases import LedgerBroker, LeaseBusy
+from .leases import LedgerBroker, LeaseBusy, mark_uncertain
 from .operation_store import process_identity
 
 PLAN_TTL = 1800
@@ -998,43 +998,16 @@ class AnsibleOps:
             import getpass
             return getpass.getuser()
 
-    def _busy(self, ledger):
-        """Name the holder of a busy ledger (read-only lock observation, as `switchyard lease status`)."""
-        try:
-            from . import locks
-            from .agent_leases import busy_message
-            observed = locks.device_locks(ledger.parent, self._paseo_agents, lease_state_dir=self.state_dir / "leases")
-            row = next(row for row in observed["ledgers"] if Path(row["path"]).resolve() == ledger.resolve())
-            return busy_message(row)
-        except Exception:
-            return f"{ledger.name[len('DEVICE_ACCESS_'):-3]} busy: holder unknown"
-
     @contextmanager
     def _lease(self, record, scope, wait):
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= MAX_LEASE_WAIT:
             raise ValueError(f"Lease wait must be 0-{MAX_LEASE_WAIT} seconds")
         ledger = Path(record["collector"]["ledger"])
-        broker = LedgerBroker({record["id"]: ledger})
-        context = broker.hold(record["id"], owner=self._lease_owner(), scope=scope,
-                              worktree=str(Path(__file__).resolve().parents[1]),
-                              metadata={"pid": os.getpid(), "via": "switchyard ansible"}, wait=wait)
-        try:
-            lease = context.__enter__()
-        except LeaseBusy:
-            raise LeaseBusy(self._busy(ledger)) from None
-        try:
-            # A device the operator broke a lease on stays off-limits until `lease clear`; checked while
-            # holding its ledger so a concurrent break cannot slip in between.
-            from .agent_leases import block_for_ledger, blocked_message
-            block = block_for_ledger(self.state_dir / "leases", ledger)
-            if block:
-                raise LeaseBusy(blocked_message(ledger.name[len("DEVICE_ACCESS_"):-3], block))
+        with LedgerBroker({record["id"]: ledger}, state_dir=self.state_dir).hold(
+                record["id"], owner=self._lease_owner(), scope=scope,
+                worktree=str(Path(__file__).resolve().parents[1]),
+                metadata={"pid": os.getpid(), "via": "switchyard ansible"}, wait=wait) as lease:
             yield lease
-        except BaseException as error:
-            if not context.__exit__(type(error), error, error.__traceback__):
-                raise
-        else:
-            context.__exit__(None, None, None)
 
     def _preflight(self, record):
         """Under the lease: identity (hostname, non-root) and `sudo -n true`, over the pinned SSH trust."""
@@ -1082,6 +1055,8 @@ class AnsibleOps:
                                                              "-m", "ansible.builtin.setup", "-a", arguments),
                                          cwd=str(self.runner.root), env=environment, timeout=120,
                                          stdout_limit=262144)
+                    if result.cancelled or result.timed_out:
+                        mark_uncertain("Ansible facts probe completion unconfirmed")
                     facts = _oneline_facts(result.stdout.decode("utf-8", "replace"), host_id)
                     facts["exit_code"] = result.exit_code
                 lease["release"].update(ansible_probe=host_id)
@@ -1312,6 +1287,8 @@ class AnsibleOps:
                     plan["check"] = {"ran": True, "exit_code": result.exit_code, "timed_out": result.timed_out,
                                      "duration_seconds": round(result.finished - result.started, 1),
                                      "stderr_tail": stderr, **summary}
+                    if result.cancelled or result.timed_out or summary["unreachable_tasks"] or summary["ended"] is None:
+                        mark_uncertain("Ansible check-mode completion unconfirmed")
                     if result.cancelled:
                         plan["blockers"].append("Switchyard stopped during the check run; nothing was applied")
                     elif result.timed_out:
@@ -1466,6 +1443,8 @@ class AnsibleOps:
                             status, error = "needs-inspection", "Switchyard stopped during the run; inspect the host"
                         elif needs_password and self._refused(summary):
                             status, error = "failed", SUDO_REFUSED
+                        if status == "needs-inspection" or summary["unreachable_tasks"]:
+                            mark_uncertain("Ansible apply completion unconfirmed")
                         final = self.store.finish(receipt["id"], {
                             "status": status, "error": error, "exit_code": result.exit_code, "timed_out": result.timed_out,
                             "stats": (summary["stats"] or {}).get(record["id"]), "changed_tasks": summary["changed_tasks"],

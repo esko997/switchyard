@@ -2,7 +2,6 @@
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import copy
-import fcntl
 import io
 import json
 import os
@@ -17,6 +16,8 @@ from unittest.mock import patch
 
 from switchyard.broker import Broker
 from switchyard import lifecycle_ops, operation_worker
+from switchyard.lease_db import resource_label
+from switchyard.leases import LedgerBroker, mark_uncertain
 from switchyard.operation_store import encode
 from switchyard.remote import RemoteError
 from operations_fixture import write_policy
@@ -28,7 +29,6 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.ledger = self.root / "alpha.ledger"
-        self.ledger.write_text("fixture baseline\n")
         self.hosts = {"alpha": {"host_id": "alpha", "transport": "ssh",
             "target": pwd.getpwuid(os.getuid()).pw_name + "@fixture.invalid",
             "expected_hostname": platform.node(), "ledger": str(self.ledger),
@@ -41,6 +41,9 @@ class LifecycleTests(unittest.TestCase):
         self.config_path = self.root / "operations.json"
         self.write_config()
         self.broker = Broker(self.config_path, hosts=self.hosts, state_dir=self.root / "state")
+        self.leases = LedgerBroker({"alpha": self.ledger}, state_dir=self.broker.lease_state_dir)
+        self.lease_store = self.leases.store
+        self.lease_label = resource_label("alpha", self.ledger)
         self.current = {"backend": "systemd", "identity": {"unit": "example.service", "fragment_sha256": "a" * 64},
                         "state": {"active": "inactive", "invocation_id": ""}, "warnings": ["Native state is not health"],
                         "supported_actions": ["start", "stop", "restart"]}
@@ -56,11 +59,15 @@ class LifecycleTests(unittest.TestCase):
 
     def fake_remote(self, host, source, request, *, timeout, local=False):
         self.locals.append(local)
-        # The fixture action must hold the canonical inode, but never a SQLite lock.
-        with self.ledger.open("a") as ledger:
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # The reservation is durable; no database transaction spans the adapter call.
+        current = self.lease_store.current(self.lease_label)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["status"], "claimed")
+        self.assertEqual(current["owner"], "switchyard")
         with closing(sqlite3.connect(self.broker.store.path, timeout=0)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.rollback()
+        with closing(sqlite3.connect(self.lease_store.path, timeout=0)) as db:
             db.execute("BEGIN IMMEDIATE")
             db.rollback()
         self.assertEqual(host["host_id"], "alpha")
@@ -78,6 +85,7 @@ class LifecycleTests(unittest.TestCase):
 
     def dispatch(self, receipt, payload):
         payload = {**payload, "operation_id": receipt["id"], "state_dir": str(self.broker.store.directory),
+                   "lease_state_dir": str(self.broker.lease_state_dir),
                    "hosts": {key: self.hosts[key] for key in receipt["host_ids"]}}
         output = io.StringIO()
         with patch.object(operation_worker.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(encode(payload).encode()))), \
@@ -96,7 +104,7 @@ class LifecycleTests(unittest.TestCase):
         with self.broker.store.transaction() as db:
             db.execute("UPDATE lifecycle_inspections SET inspected_at=?", (old,))
 
-    def test_local_collector_target_runs_lifecycle_locally_under_its_ledger(self):
+    def test_local_collector_target_runs_lifecycle_locally_under_its_lease(self):
         ssh = self.hosts["alpha"]
         self.broker.hosts["alpha"] = {"host_id": "alpha", "transport": "local", "expected_hostname": ssh["expected_hostname"],
                                       "user_units": [], "system_units": []}
@@ -106,7 +114,7 @@ class LifecycleTests(unittest.TestCase):
         proposal = self.broker.plan("start", "service")
         receipt = self.broker.execute(proposal["id"], approved=True, request_id="local-start")["receipt"]
         self.assertEqual(receipt["status"], "succeeded", receipt)
-        # fake_remote also asserts the canonical ledger was held throughout.
+        # fake_remote also asserts the durable reservation was held throughout.
         self.assertEqual(self.locals, [True, True])
         del self.config["local_targets"]
         self.write_config()
@@ -118,7 +126,6 @@ class LifecycleTests(unittest.TestCase):
         self.broker.hosts["alpha"] = {"host_id": "alpha", "transport": "local", "expected_hostname": ssh["expected_hostname"],
                                       "user_units": [], "system_units": []}
         other_ledger = self.root / "other.ledger"
-        other_ledger.write_text("other baseline\n")
         for mode in ("revoked", "account", "ledger"):
             with self.subTest(mode=mode):
                 self.config["local_targets"] = {"alpha": {"target": ssh["target"], "ledger": ssh["ledger"]}}
@@ -191,7 +198,10 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(replay["receipt"], receipt)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.broker.placements(), {})
-        self.assertIn('"event": "RELEASE"', self.ledger.read_text())
+        self.assertIsNone(self.lease_store.current(self.lease_label))
+        self.assertTrue(any(event["event"] == "RELEASE" and event["device"] == self.lease_label
+                            for event in self.lease_store.history()))
+        self.assertFalse(self.ledger.exists())
 
     def test_plan_requires_fresh_evidence_and_never_contacts_remote(self):
         with self.assertRaisesRegex(ValueError, "inspection required"):
@@ -289,16 +299,42 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertEqual(self.current["state"]["active"], "inactive")
         self.assertEqual(self.broker.lifecycle_inspections(), {})
+        self.assertIsNone(self.lease_store.current(self.lease_label))
 
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_transport_uncertainty_has_no_retry_and_invalidates_cache(self):
         self.inspect()
         proposal = self.broker.plan("restart", "service")
-        with patch.object(lifecycle_ops, "run_remote", side_effect=RemoteError("private transport detail")) as remote:
+
+        def interrupted(*args, **kwargs):
+            # Match the real transport's durable failure mark before it raises.
+            mark_uncertain("Fixture transport interrupted", resource="alpha")
+            raise RemoteError("private transport detail")
+
+        with patch.object(lifecycle_ops, "run_remote", side_effect=interrupted) as remote:
             receipt = self.broker.execute(proposal["id"], approved=True, request_id="uncertain")["receipt"]
             self.assertEqual(remote.call_count, 1)
         self.assertEqual(receipt["status"], "needs-inspection")
         self.assertNotIn("private transport detail", encode(receipt))
         self.assertEqual(self.broker.lifecycle_inspections(), {})
+        current = self.lease_store.current(self.lease_label)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["status"], "suspect")
+        restarted = LedgerBroker({"alpha": self.ledger}, state_dir=self.broker.lease_state_dir)
+        self.assertEqual(restarted.store.current(self.lease_label)["lease_id"], current["lease_id"])
+        before = len(self.calls)
+        blocked = self.broker.inspect_workload("service", request_id="inspect-before-attestation")["receipt"]
+        self.assertEqual(blocked["status"], "busy")
+        self.assertEqual(len(self.calls), before)
+        # Offline fixture only: inspection and stopped-work attestation precede any new grant.
+        block = self.lease_store.break_device(
+            self.lease_label, reason="Inspected isolated fixture effects", operator="fixture operator",
+            expected_id=current["lease_id"])
+        self.lease_store.clear(
+            self.lease_label, operator="fixture operator", expected_block=block,
+            attest_stopped="Inspected fixture transport and remote state; no work remains")
+        self.inspect("inspect-after-attestation")
+        self.assertIsNone(self.lease_store.current(self.lease_label))
 
     def test_unsupported_inspection_is_visible_but_not_plannable(self):
         self.current["supported_actions"] = []
@@ -326,12 +362,13 @@ class LifecycleTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_lease_busy_does_not_inspect_or_mutate(self):
-        with self.ledger.open("a") as ledger:
-            fcntl.flock(ledger, fcntl.LOCK_EX)
+        with self.leases.hold("alpha", owner="fixture blocker", scope="busy device test",
+                              worktree=str(self.root)):
             receipt = self.broker.inspect_workload("service", request_id="busy")["receipt"]
         self.assertEqual(receipt["status"], "busy")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.broker.lifecycle_inspections(), {})
+        self.assertIsNone(self.lease_store.current(self.lease_label))
 
     def test_receipts_reject_unbounded_or_secret_bearing_adapter_evidence(self):
         for invalid in ({"env": {"TOKEN": "private-value"}}, {"huge": "x" * 4097}, {"number": float("nan")}):

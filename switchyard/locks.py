@@ -237,7 +237,7 @@ def _entries(stream):
     return entries[-5:]
 
 
-def device_locks(ledger_dir=DEFAULT_LEDGER_DIR, paseo_agents=None, *, lease_state_dir=None):
+def device_locks(ledger_dir=DEFAULT_LEDGER_DIR, paseo_agents=None, *, paths=None):
     """Observe ledgers without flocking or modifying them; unavailable evidence stays unknown."""
     now = datetime.datetime.now(datetime.timezone.utc)
     result = {"observed_at": now.isoformat(), "ledgers": []}
@@ -248,18 +248,19 @@ def device_locks(ledger_dir=DEFAULT_LEDGER_DIR, paseo_agents=None, *, lease_stat
         ticks = os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError):
         ticks = None
-    try:
-        paths = []
-        with os.scandir(ledger_dir) as directory:
-            for entry in directory:
-                if (entry.name.startswith("DEVICE_ACCESS_") and entry.name.endswith(".md")
-                        and entry.is_file(follow_symlinks=False)):
-                    paths.append(Path(entry.path))
-                    if len(paths) >= 64:
-                        break
-        paths.sort()
-    except OSError:
-        return result
+    if paths is None:
+        try:
+            paths = []
+            with os.scandir(ledger_dir) as directory:
+                for entry in directory:
+                    if (entry.name.startswith("DEVICE_ACCESS_") and entry.name.endswith(".md")
+                            and entry.is_file(follow_symlinks=False)):
+                        paths.append(Path(entry.path))
+                        if len(paths) >= 64:
+                            break
+        except OSError:
+            return result
+    paths = sorted(paths)
     process_cache = {}
     mounts = _mounts() if holders is not None else []
     for path in paths:
@@ -332,7 +333,4 @@ def device_locks(ledger_dir=DEFAULT_LEDGER_DIR, paseo_agents=None, *, lease_stat
                     pass
         result["ledgers"].append({"device": path.name[len("DEVICE_ACCESS_"):-3], "path": str(path),
                                   "state": state, "holders": processes, "last_entries": entries, "anomaly": anomaly})
-    if lease_state_dir is not None:
-        from .agent_leases import enrich_locks
-        enrich_locks(result, lease_state_dir)
     return result

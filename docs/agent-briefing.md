@@ -30,13 +30,11 @@ Do not run collection, monitoring, inspections, shell, key changes, definition s
 
 ## Device access
 
-Use the designated control host and canonical ledgers, never a checkout copy. The default root is:
-
-```sh
-${XDG_STATE_HOME:-$HOME/.local/state}/switchyard/ledgers
-```
-
-`SWITCHYARD_LEDGER_DIR` overrides it. Use `switchyard lease run` for one command, or `hold`/`release` across steps; release immediately when done. Busy, suspect or blocked means defer, not bypass. Only the human operator may break/clear locks after confirming the old operation stopped. Do not hold device leases while building.
+Use the designated control host's lease API, never files copied into a checkout.
+Use `switchyard lease run` for one command or `hold`/`release` across steps.
+Release the exact ID once work is confirmed complete. Busy, suspect or blocked
+means defer, not bypass. Only the human operator may attest that uncertain
+work stopped and clear the reservation. Do not hold device leases while building.
 
 Android needs a configured immutable USB serial and SDK root (`ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then `~/Android/Sdk`). Use that SDK's `platform-tools/adb` with exact serial and disconnected stdin in scripts. Do not start/restart the server, connect wireless transports, wake a device or send input as part of observation.
 

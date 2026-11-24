@@ -1,8 +1,6 @@
-"""Worker/store boundaries with real locks and private durable state."""
-import fcntl
+"""Worker/store boundaries with durable leases."""
 import io
 import json
-import os
 from pathlib import Path
 import signal
 import tempfile
@@ -11,6 +9,7 @@ from unittest.mock import patch
 
 from switchyard import operation_worker, podman_ops
 from switchyard.broker import Broker
+from switchyard.lease_db import LeaseStore
 from switchyard.operation_store import encode
 
 
@@ -20,10 +19,10 @@ class WorkerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.broker = Broker(None, hosts={}, state_dir=self.root / "state")
+        self.leases = LeaseStore(self.broker.lease_state_dir / "leases")
         self.hosts = {}
         for name in ("alpha", "beta"):
             ledger = self.root / name
-            ledger.write_text("baseline\n")
             self.hosts[name] = {"host_id": name, "ledger": str(ledger)}
         for signum in (signal.SIGTERM, signal.SIGINT):
             handler = signal.getsignal(signum)
@@ -39,6 +38,7 @@ class WorkerTests(unittest.TestCase):
 
     def run_worker(self, receipt, placement, execute):
         payload = {"kind": "managed", "state_dir": str(self.broker.store.directory), "operation_id": receipt["id"],
+                   "lease_state_dir": str(self.broker.lease_state_dir),
                    "hosts": self.hosts, "request": {"workload_id": "foobar", "placement": placement}}
         stream = io.TextIOWrapper(io.BytesIO(encode(payload).encode()))
         with patch.object(operation_worker.sys, "stdin", stream), patch.object(operation_worker.sys, "stdout", io.StringIO()) as output, \
@@ -53,9 +53,7 @@ class WorkerTests(unittest.TestCase):
         recovery = {"source": original, "target_id": "beta"}
         def execute(request, hosts, emit):
             for host in hosts.values():
-                with Path(host["ledger"]).open("a") as stream:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertIsNotNone(self.leases.current(host["host_id"].upper()))
             emit("recovery-intent", recovery)
             return {"status": "failed", "error": "verified stopped source; destination refused",
                     "placement": {**original, "lifecycle": "stopped", "recovery": recovery}}
@@ -64,9 +62,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(placement["lifecycle"], "stopped")
         self.assertEqual(placement["recovery"], recovery)
         self.assertEqual(self.broker.receipt(receipt["id"])["status"], "failed")
-        for host in self.hosts.values():
-            with Path(host["ledger"]).open("a") as stream:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertTrue(all(self.leases.current(host.upper()) is None for host in self.hosts))
 
     def test_interrupted_deployment_retains_identity_and_can_plan_recovery(self):
         receipt = self.begin()
@@ -82,6 +78,17 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(placement["uncertain"])
         self.assertEqual(placement["lifecycle"], "unknown")
         self.assertEqual(self.broker.receipt(receipt["id"])["status"], "needs-inspection")
+        self.assertTrue(all(self.leases.current(host.upper())["suspect"] for host in self.hosts))
+
+    def test_admin_block_in_shared_state_prevents_any_dispatch(self):
+        self.leases.break_device("BETA", reason="operator fixture", operator="operator")
+        receipt = self.begin()
+        self.run_worker(receipt, None, lambda *args: self.fail("Sent work to a blocked device"))
+        result = self.broker.receipt(receipt["id"])
+        self.assertEqual(result["status"], "busy")
+        self.assertIn("blocked", result["error"])
+        self.assertIsNone(self.leases.current("ALPHA"))
+        self.assertIsNotNone(self.leases.block("BETA"))
 
     def test_changed_placement_refuses_action_even_if_parent_planned_earlier(self):
         original = {"host_id": "alpha", "lifecycle": "running"}

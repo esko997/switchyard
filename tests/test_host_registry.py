@@ -59,7 +59,6 @@ class HostRegistryTests(unittest.TestCase):
         self.catalog = self.root / "catalog.json"
         self.collectors = self.root / "collectors.json"
         self.ledger = self.root / "ledger.md"
-        self.ledger.write_text("test-only ledger\n")
         self.document = {"schema_version": 1, "provenance": "isolated test", "workloads": [],
                          "devices": [{"id": host, "name": host, "platform": "linux", "architecture": "x86_64",
                                       "capabilities": ["linux"], "notes": "isolated test", "provenance": "test",
@@ -85,7 +84,7 @@ class HostRegistryTests(unittest.TestCase):
 
     def observe(self, service, host):
         at = datetime.fromtimestamp(self.now, timezone.utc).isoformat()
-        with patch("switchyard.core.collect_host", side_effect=lambda config: snapshot(config, at)):
+        with patch("switchyard.core.collect_host", side_effect=lambda config, **_: snapshot(config, at)):
             return service.collect_host(host)
 
     def test_symlinked_state_root_seeds_pins(self):

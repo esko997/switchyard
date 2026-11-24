@@ -9,7 +9,6 @@ import hashlib
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 import copy
-import fcntl
 import io
 import json
 import os
@@ -30,6 +29,8 @@ from unittest.mock import patch
 from switchyard import deploy, deploy_config, deploy_remote, lan_dns_sync, operation_worker, spec
 from switchyard.lan_routes import LanRoutes
 from switchyard.broker import Broker
+from switchyard.lease_db import resource_label
+from switchyard.leases import LedgerBroker, mark_uncertain
 from switchyard.operation_store import encode
 from switchyard.remote import RemoteError
 
@@ -320,13 +321,14 @@ class DeployFixture(unittest.TestCase):
         self.hosts = {}
         for name in ("alpha", "beta"):
             ledger = self.root / (name + ".ledger")
-            ledger.write_text("fixture baseline\n")
             self.hosts[name] = {"host_id": name, "transport": "ssh", "target": pwd.getpwuid(os.getuid()).pw_name + "@fixture.invalid",
                                 "expected_hostname": platform.node(), "ledger": str(ledger), "user_units": [], "system_units": []}
         self.config = {"schema_version": 2, "shell_hosts": [], "workloads": {}, "deploy_hosts": ["alpha"]}
         self.config_path = self.root / "operations.json"
         self.write_config()
         self.broker = Broker(self.config_path, hosts=self.hosts, state_dir=self.root / "state")
+        self.leases = LedgerBroker({name: Path(host["ledger"]) for name, host in self.hosts.items()},
+                                  state_dir=self.broker.lease_state_dir)
         self.manager = deploy.DeployManager(self.broker)
         self.host = FakeHost(self.root)
         self.remote_actions, self.remote_payloads = [], []
@@ -350,10 +352,10 @@ class DeployFixture(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.config))
 
     def fake_remote(self, host, source, payload, *, timeout, local=False):
-        # The canonical ledger is held by the worker for the whole remote step.
-        with open(host["ledger"], "a") as ledger:
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease = self.leases.store.current(resource_label(host["host_id"], host["ledger"]))
+        self.assertIsNotNone(lease)  # durable authority is held for the whole remote step
+        self.assertEqual((lease["resource"], lease["owner"], lease["status"]), (host["host_id"], "switchyard", "claimed"))
+        self.assertFalse(Path(host["ledger"]).exists())  # metadata only, never a second authority
         self.assertIn("def main(payload)", source)
         self.assertTrue(1 <= timeout <= 270)
         self.remote_actions.append(payload["action"])
@@ -365,6 +367,7 @@ class DeployFixture(unittest.TestCase):
 
     def dispatch(self, receipt, payload):
         payload = {**payload, "operation_id": receipt["id"], "state_dir": str(self.broker.store.directory),
+                   "lease_state_dir": str(self.broker.lease_state_dir),
                    "hosts": {key: self.hosts[key] for key in receipt["host_ids"]}}
         payload.pop("operation_hosts", None)
         output = io.StringIO()
@@ -1202,6 +1205,7 @@ class DeployTests(DeployFixture):
 
         def lost(host, source, payload, *, timeout, local=False):
             if payload["action"] == "verify":
+                mark_uncertain("fixture verification transport lost", resource=host["host_id"])
                 raise RemoteError("transport lost")
             return self.fake_remote(host, source, payload, timeout=timeout, local=local)
 
@@ -1215,8 +1219,8 @@ class DeployTests(DeployFixture):
     def test_verify_busy_lease_is_unreachable_and_not_recorded(self):
         self.save_template()
         self.deploy()
-        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), open(self.hosts["alpha"]["ledger"], "a") as ledger:
-            fcntl.flock(ledger, fcntl.LOCK_EX)
+        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), \
+                self.leases.hold("alpha", owner="fixture", scope="busy verification", worktree=str(self.root)):
             result, verification = self.verify()
         self.assertEqual(result["receipt"]["status"], "busy")
         self.assertEqual((verification["consistent"], self.codes(verification)), (False, ["unreachable"]))
@@ -1260,20 +1264,22 @@ class DeployTests(DeployFixture):
         names = ["site-%02d" % index for index in range(deploy.VERIFY_BATCH + 1)]
         for name in names:
             self.deploy(name)
-        ledger = Path(self.hosts["alpha"]["ledger"])
-        claims_before = ledger.read_text().count('"event": "CLAIM"')
+        leases_before = {lease["lease_id"] for lease in self.leases.store.records()}
         calls = []
 
         def second_batch_lost(host, source, payload, *, timeout, local=False):
             if payload["action"] == "verify":
                 calls.append([item["instance_id"] for item in payload["items"]])
                 if len(calls) == 2:
+                    mark_uncertain("fixture verification transport lost", resource=host["host_id"])
                     raise RemoteError("transport lost")
             return self.fake_remote(host, source, payload, timeout=timeout, local=local)
 
         with patch.object(deploy, "run_remote", side_effect=second_batch_lost):
             result = self.manager.verify_all()
-        self.assertEqual(ledger.read_text().count('"event": "CLAIM"') - claims_before, 1)  # one lease for the host
+        acquired = [lease for lease in self.leases.store.records() if lease["lease_id"] not in leases_before]
+        self.assertEqual(len(acquired), 1)  # one durable lease for both batches on the host
+        self.assertEqual((acquired[0]["device"], acquired[0]["status"]), ("ALPHA", "suspect"))
         self.assertEqual(len(result["hosts"]), 1)
         host = result["hosts"][0]
         self.assertEqual((host["instance_ids"], host["receipt"]["status"]), (names, "needs-inspection"))
@@ -1626,6 +1632,11 @@ class DeployTests(DeployFixture):
         self.assertTrue(self.state("lan-dns")["meta"]["uncertain"])
         with self.assertRaisesRegex(ValueError, "uncertain"):
             self.manager.refresh_plan("lan-dns", add_records={"c": "192.168.50.4"})
+        lease = self.leases.store.current("ALPHA")
+        self.assertEqual(lease["status"], "suspect")
+        self.leases.store.break_device("ALPHA", reason="fixture recovery", operator="test",
+                                       attest_stopped="The injected refresh transport failed before the remote call ran",
+                                       expected_id=lease["lease_id"])
         self.save_template()
         self.deploy("garden")
         with self.assertRaisesRegex(ValueError, "no configuration files"):
@@ -1964,6 +1975,7 @@ class DeployLifecycleTests(DeployFixture):
         def lost(host, source, payload, *, timeout, local=False):
             result = self.fake_remote(host, source, payload, timeout=timeout, local=local)
             if payload["action"] == "start":
+                mark_uncertain("fixture start acknowledgement lost", resource=host["host_id"])
                 raise RemoteError("start acknowledgement lost")
             return result
 
@@ -1979,6 +1991,11 @@ class DeployLifecycleTests(DeployFixture):
         replay = self.manager.lifecycle_apply(plan["id"], approved=True, request_id="lost-start")
         self.assertTrue(replay["replayed"])
         self.assertEqual(self.remote_actions, [])
+        lease = self.leases.store.current("ALPHA")
+        self.assertEqual(lease["status"], "suspect")
+        self.leases.store.break_device("ALPHA", reason="fixture recovery", operator="test",
+                                       attest_stopped="The in-process remote start returned; no transport or worker remains",
+                                       expected_id=lease["lease_id"])
         self.assertEqual(self.lifecycle("stop", request_id="recover-lost-start")["receipt"]["status"], "succeeded")
         self.assertEqual(self.host.pods, {})
 

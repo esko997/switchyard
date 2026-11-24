@@ -170,7 +170,7 @@ Test vectors (checked independently with `openssl dgst -sha256 -binary | head -c
 - The owner reads `<name> (<user>, paseo:<agent8>; key <id8>)`.
 - If the key's claimed `host_id` is a registry host, `@<host>` is appended and the origin host and agent ID are recorded.
 
-The result is `{lease_id, device, expires_at}`. A busy ledger or a blocked device returns 409 naming the holder. Detached holds are TTL-only: the client must release, or let the TTL end the hold. SSH `switchyard lease` remains preferred wherever it works, because it holds the lease for a command's lifetime and fails closed.
+The result is `{lease_id, device, expires_at}`. A busy or blocked device returns 409 naming the holder. Detached holds must be released after confirmed completion; expiry leaves a suspect reservation. SSH `switchyard lease run` is preferred where possible: the client can confirm completion directly.
 
 ## TLS
 
@@ -220,7 +220,7 @@ Other commands:
 
 - Operator: `switchyard auth revoke KEY_ID`, or Revoke in the Access tab (`POST /api/keys/<id>/revoke`).
 - The key itself: `POST /api/keys/self/revoke` (`switchyard unenroll` on the client).
-- A revoked or expired key gets 401 on its next request. Leases the key already took run until their TTL ends or someone releases them.
+- A revoked or expired key gets 401 on its next request. Revocation is not proof that a command finished. Its outstanding lease stays reserved until confirmed completion or operator attestation.
 - `switchyard auth logout-all` ends every browser session.
 
 ## Limits
@@ -229,6 +229,6 @@ Other commands:
 - **The CLI operator check is best effort.** It looks for agent process ancestry and `PASEO_AGENT_ID`, as `lease break` does. A determined local process can evade it. `set-password` additionally requires a terminal.
 - **The CA is self-signed.** Clients must pin it on first use or check its fingerprint out of band. Browsers show a warning until the CA is installed.
 - **A key is as trusted as its host.** A key holder on an approved host can do everything its scope allows on its hosts, until the key expires or is revoked.
-- **Key-held leases are TTL-only.** The server cannot see the key holder's processes.
+- **Key-held leases are detached.** The server cannot observe the claimant's processes. Missing the deadline leaves a suspect reservation.
 - **Workload operations are desk-only for keys.** Inspect, plan and execute are refused for keys because their hosts are not known before execution.
 - **Concurrent issuers.** Renewing the certificate while a LAN listener runs does not affect that listener until it restarts. It keeps serving, and computing codes from, the certificate it loaded.

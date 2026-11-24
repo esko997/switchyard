@@ -1,11 +1,13 @@
 """The desk's generic lifecycle routes against the real deployment worker on a fixture host."""
 import http.client
 import json
+from pathlib import Path
 import threading
 from unittest.mock import patch
 
 from switchyard.web import create_server
 from test_deploy import DeployFixture, ROOT
+from switchyard.leases import LedgerBroker
 
 
 class WorkloadLifecycleTests(DeployFixture):
@@ -24,6 +26,8 @@ class WorkloadLifecycleTests(DeployFixture):
         self.addCleanup(self.server.server_close)
         self.broker = self.server.service._broker
         self.hosts = self.broker.hosts
+        self.leases = LedgerBroker({name: Path(host["ledger"]) for name, host in self.hosts.items()},
+                                   state_dir=self.broker.lease_state_dir)
         self.manager = self.server.service.deployments()
         patch.object(self.broker, "_dispatch", side_effect=self.dispatch).start()
         self.save_template()

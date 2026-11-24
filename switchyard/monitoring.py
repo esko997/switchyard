@@ -55,7 +55,7 @@ class Monitor:
         config = self.configs[host_id]
         mode = "full" if lane == "inventory" else lane
         result = self.cache.refresh(host_id, config, lambda record: collector.collect_host(
-            record, mode=mode, previous=self.cache.read(host_id)["snapshot"]), lane=lane)
+            record, mode=mode, previous=self.cache.read(host_id)["snapshot"], state_dir=self.cache.directory), lane=lane)
         attempt = result["last_attempt"]
         remaining = None
         if attempt["status"] == "cooldown":

@@ -11,9 +11,10 @@ locks and Switchyard itself live on the control host; every command here runs th
 
 `lease run` holds the lease through one SSH connection (`switchyard lease attach --heartbeat` on the
 control host): newline heartbeats every 15 s while the command runs, and a final `done` line once the
-command has exited and been reaped; only `done` (or an explicit `lease release`) releases. A lost
-connection is fail-closed: the control host keeps the lock as `suspect`, this client terminates the
-command and then tries to release explicitly. The command dies with this client (PR_SET_PDEATHSIG).
+command exits normally with no surviving process group; only confirmed completion
+releases. A lost connection is fail-closed: the client terminates its local command,
+but the lease remains suspect until completion is verified. The command receives
+SIGTERM if this client dies (PR_SET_PDEATHSIG).
 Exit codes: the command's own; 75 busy (nothing ran); 76 the lease was lost while the command ran (the
 command was terminated); 255 the control host was unreachable; 2 usage errors and refused commands.
 
@@ -54,8 +55,6 @@ RELEASE_WAIT = 30     # seconds to wait for the control host to confirm RELEASE
 KILL_GRACE = 10       # seconds between SIGTERM and SIGKILL when a lease is lost
 HEARTBEAT_INTERVAL = 15  # seconds between newline heartbeats on the attach connection
 HEARTBEAT_WINDOW = 60    # silence after which the control host marks the lease suspect (lock kept)
-RELEASE_RETRY_WINDOW = 120  # seconds to keep trying `lease release` after a lost connection
-RELEASE_RETRY_PAUSE = 5     # seconds between those attempts
 PR_SET_PDEATHSIG = 1
 LEASE_ID = re.compile(r"[0-9a-f]{32}\Z")
 PASEO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -261,38 +260,6 @@ def die_with_parent(parent):
     return setup
 
 
-def release_after_loss(config, lease_id, device):
-    """After a lost connection (command already terminated and reaped): reconnect and release the lease,
-    which the control host otherwise keeps as `suspect`. Bounded attempts; reports the outcome."""
-    deadline = time.monotonic() + RELEASE_RETRY_WINDOW
-    attempt, detail = 0, ""
-    while True:
-        attempt += 1
-        argv = ssh_argv(config, [config["switchyard"], "lease", "release", lease_id])
-        argv[1:1] = ["-o", "ConnectTimeout=10"]
-        try:
-            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-            code, detail = result.returncode, (result.stderr or result.stdout).strip()[-300:]
-        except (OSError, subprocess.TimeoutExpired) as error:
-            code, detail = EXIT_UNREACHABLE, str(error)
-        if code == 0:
-            print(f"switchyard: lease {lease_id} on {device} was released explicitly after the connection was lost "
-                  f"(attempt {attempt})", file=sys.stderr)
-            return True
-        if code != EXIT_UNREACHABLE:
-            # The control host answered: typically the lease already ended there (no longer active).
-            print(f"switchyard: release of lease {lease_id} on {device} refused by the control host "
-                  f"(exit {code}): {detail}. Check `switchyard lease status {device}`.", file=sys.stderr)
-            return False
-        if time.monotonic() + RELEASE_RETRY_PAUSE >= deadline:
-            break
-        time.sleep(RELEASE_RETRY_PAUSE)
-    print(f"switchyard: could not reach the control host after {attempt} attempts ({detail}). Lease {lease_id} on "
-          f"{device} is left SUSPECT and still held there; the command is no longer running, so clear it with "
-          f"`switchyard lease release {lease_id}` when the control host is reachable.", file=sys.stderr)
-    return False
-
-
 def group_alive(pgid):
     try:
         os.killpg(pgid, 0)
@@ -338,13 +305,13 @@ def lease_run(config, arguments):
     options.add_argument("--pass-lock-fd", action="store_true", help=argparse.SUPPRESS)
     args = options.parse_args(arguments[:delimiter])
     if args.pass_lock_fd:
-        return fail("--pass-lock-fd is unavailable remotely: the ledger descriptor lives on the control host")
+        return fail("--pass-lock-fd is unavailable: leases are durable records, not file descriptors")
     if not command:
         return fail("lease run needs a command after --")
     if not 0 <= args.wait <= 600:
         return fail("--wait must be between 0 and 600 seconds")
     remote = [config["switchyard"], "lease", "attach", args.device, "--scope", args.scope,
-              "--wait", format(args.wait, "g"), "--heartbeat", format(HEARTBEAT_WINDOW, "g"),
+              "--wait", format(args.wait, "g"), "--heartbeat", format(HEARTBEAT_WINDOW, "g"), "--completion-proof",
               "--worktree", worktree(config), *origin_args(config)]
     if args.owner:
         remote += ["--owner", args.owner]
@@ -419,17 +386,22 @@ def lease_run(config, arguments):
                     lost = "heartbeats can no longer be written to the control host"
             if lost:
                 break
-        if lost and (child.poll() is None or group_alive(child.pid)):
-            print(f"switchyard: LEASE LOST on {device} ({lost}) while the command was running: the device is no "
-                  "longer safely reserved. Terminating the command (SIGTERM, SIGKILL after 10 s).", file=sys.stderr)
-            stop_command(child)  # Returns only once the command is reaped and its process group is empty.
+        if lost:
+            print(f"switchyard: LEASE LOST on {device} ({lost}); terminating the local command and leaving "
+                  f"lease {lease_id} reserved until completion is confirmed.", file=sys.stderr)
+            stop_command(child)
             close_connection(ssh, 5)
-            if message is None:
-                release_after_loss(config, lease_id, device)
             return EXIT_LOST
         code = child.wait()
         exit_code = code if code >= 0 else 128 - code
-        # The command is reaped: `done` is the release; the control host answers with a `released` line.
+        if signals.received or code < 0 or code == EXIT_UNREACHABLE or group_alive(child.pid):
+            # Neither an SSH failure nor local process cleanup proves a remote command stopped.
+            stop_command(child)
+            close_connection(ssh, 5)
+            print(f"switchyard: completion on {device} is unconfirmed; lease {lease_id} stays reserved.",
+                  file=sys.stderr)
+            return exit_code or EXIT_LOST
+        # Claim ID still identifies this grant if the confirmation reply is lost.
         os.set_blocking(beat, True)
         try:
             os.write(beat, b"done\n")
@@ -448,9 +420,8 @@ def lease_run(config, arguments):
                 released = message
         status = close_connection(ssh, 5)
         if released is None or status != 0:
-            print(f"switchyard: release of {device} was not confirmed (ssh exit {status}); releasing it explicitly",
-                  file=sys.stderr)
-            release_after_loss(config, lease_id, device)
+            print(f"switchyard: completion of lease {lease_id} on {device} was not acknowledged "
+                  f"(ssh exit {status}); check `switchyard lease status {device}`.", file=sys.stderr)
         elif released.get("reason") != "released":
             print(f"switchyard: lease on {device} ended early ({released.get('reason')}) before the command finished",
                   file=sys.stderr)
@@ -470,7 +441,7 @@ def lease(config, arguments):
         options.add_argument("--wait", type=float, default=0)
         options.add_argument("--owner")
         args = options.parse_args(rest)
-        # The owning agent runs here, not on the control host: a TTL-only (detached) hold.
+        # The owning agent runs elsewhere, so the authority cannot watch its local process.
         remote += [args.device, "--scope", args.scope, "--ttl", args.ttl, "--wait", format(args.wait, "g"),
                    "--detached", "--worktree", worktree(config), *origin_args(config)]
         if args.owner:

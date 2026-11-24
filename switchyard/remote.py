@@ -9,6 +9,7 @@ import time
 
 from .collector import _json, _ssh_command
 from . import host_context
+from .leases import mark_uncertain
 
 MAX_OUTPUT = 262144
 MAX_ERRORS = 16384
@@ -111,10 +112,12 @@ def run_remote(host: dict, source: str, payload: dict, *, timeout: int = 60, loc
         if not isinstance(value, dict):
             raise ValueError("Expected object")
         return value
-    except RemoteError:
+    except BaseException as error:
+        # A lost or malformed transport result cannot confirm completion.
+        mark_uncertain("operation transport completion unconfirmed", resource=host.get("host_id"))
+        if isinstance(error, (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError)):
+            raise RemoteError("Invalid or unavailable SSH operation response; effects need inspection") from error
         raise
-    except (OSError, ValueError, TypeError, UnicodeError, subprocess.SubprocessError) as error:
-        raise RemoteError("Invalid or unavailable SSH operation response; effects need inspection") from error
 
 
 SHELL_SOURCE = r'''

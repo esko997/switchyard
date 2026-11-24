@@ -1,5 +1,4 @@
 """Durable broker behavior using local fixture transport only, never a real host."""
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from switchyard.broker import Broker
+from switchyard.lease_db import LeaseStore
+from switchyard.leases import LedgerBroker
 from switchyard.operation_store import encode
 from operations_fixture import write_policy
 
@@ -25,8 +26,7 @@ class BrokerTests(unittest.TestCase):
         self.site.write_text("<h1>fixture</h1>")
         self.hosts = {}
         for name in ("alpha", "beta"):
-            ledger = self.root / (name + ".ledger")
-            ledger.write_text("fixture baseline\n")
+            ledger = self.root / ("DEVICE_ACCESS_" + name.upper() + ".md")
             self.hosts[name] = {"host_id": name, "transport": "ssh", "target": pwd.getpwuid(os.getuid()).pw_name + "@fixture.invalid",
                                 "expected_hostname": platform.node(), "ledger": str(ledger), "user_units": [], "system_units": []}
         self.config = {"schema_version": 1, "shell_hosts": ["alpha", "beta"], "workloads": {"foobar": {
@@ -46,6 +46,7 @@ class BrokerTests(unittest.TestCase):
         self.path_patch.start()
         self.addCleanup(self.path_patch.stop)
         self.broker = Broker(self.config_path, hosts=self.hosts, state_dir=self.state)
+        self.leases = LeaseStore(self.state / "leases")
 
     def test_shell_is_unrestricted_and_replay_is_durable_with_the_script_but_without_output(self):
         marker = self.root / "marker"
@@ -72,6 +73,55 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different intent"):
             restarted.shell("alpha", "true", request_id="shell-1")
 
+    def test_confirmed_shell_failure_releases_the_device(self):
+        result = self.broker.shell("alpha", "exit 7", request_id="confirmed-failure")
+        self.assertEqual(result["receipt"]["status"], "failed")
+        self.assertEqual(result["receipt"]["exit_code"], 7)
+        self.assertIsNone(self.leases.current("ALPHA"))
+        self.assertEqual([event["event"] for event in reversed(self.leases.history())], ["CLAIM", "RELEASE"])
+        self.assertFalse(Path(self.hosts["alpha"]["ledger"]).exists())
+
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
+    def test_transport_loss_retains_suspect_until_operator_clear(self):
+        marker = self.root / "transport-marker"
+        script = "touch '" + str(marker) + "'"
+        ssh = self.root / "bin/ssh"
+        transport = ssh.read_text()
+        ssh.write_text(transport.split("\n", 1)[0] + "\nimport sys\nsys.exit(255)\n")
+        first = self.broker.shell("alpha", script, request_id="lost-transport")
+        self.assertEqual(first["receipt"]["status"], "needs-inspection")
+        held = self.leases.current("ALPHA")
+        self.assertEqual(held["status"], "suspect")
+        self.assertTrue(held["suspect_cause"])
+        self.assertFalse(any(event["event"] == "RELEASE" for event in self.leases.history()))
+        ssh.write_text(transport)
+        restarted = Broker(self.config_path, hosts=self.hosts, state_dir=self.state)
+        replay = restarted.shell("alpha", script, request_id="lost-transport")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["receipt"]["id"], first["receipt"]["id"])
+        blocked = restarted.shell("alpha", script, request_id="still-suspect")
+        self.assertEqual(blocked["receipt"]["status"], "busy")
+        self.assertEqual(self.leases.current("ALPHA")["lease_id"], held["lease_id"])
+        self.assertFalse(marker.exists())
+        self.leases.break_device("ALPHA", reason="fixture transport inspected", operator="tester",
+                                 expected_id=held["lease_id"])
+        self.leases.clear("ALPHA", operator="tester", attest_stopped="fixture has no remote process",
+                          expected_block=self.leases.block("ALPHA"))
+        recovered = restarted.shell("alpha", script, request_id="after-operator-clear")
+        self.assertEqual(recovered["receipt"]["status"], "succeeded")
+        self.assertTrue(marker.exists())
+        self.assertIsNone(self.leases.current("ALPHA"))
+
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
+    def test_shell_timeout_retains_suspect_and_blocks_the_next_request(self):
+        first = self.broker.shell("alpha", "sleep 30", timeout_seconds=1, request_id="shell-timeout")
+        self.assertEqual(first["receipt"]["status"], "needs-inspection")
+        held = self.leases.current("ALPHA")
+        self.assertEqual(held["status"], "suspect")
+        second = self.broker.shell("alpha", "true", request_id="after-timeout")
+        self.assertEqual(second["receipt"]["status"], "busy")
+        self.assertEqual(self.leases.current("ALPHA")["lease_id"], held["lease_id"])
+
     def test_receipt_views_preview_in_lists_full_script_singly_and_redact_for_other_machines(self):
         from types import SimpleNamespace
         from switchyard.core import Service
@@ -92,15 +142,61 @@ class BrokerTests(unittest.TestCase):
     @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_all_leases_are_acquired_before_any_remote_execution(self):
         marker = self.root / "must-not-exist"
-        with Path(self.hosts["beta"]["ledger"]).open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with LedgerBroker({"beta": Path(self.hosts["beta"]["ledger"])}, state_dir=self.state).hold(
+                "beta", owner="other-agent", scope="fixture contention", worktree=str(self.root)):
             result = self.broker.shell("alpha", "touch '" + str(marker) + "'", request_id="multi-host", extra_host_ids=["beta"])
+            self.assertEqual(self.leases.current("BETA")["owner"], "other-agent")
+            self.assertIsNone(self.leases.current("ALPHA"))
         self.assertEqual(result["receipt"]["status"], "busy")
         self.assertFalse(marker.exists())
         self.assertEqual(result["receipt"]["host_ids"], ["alpha", "beta"])
-        ledger = Path(self.hosts["alpha"]["ledger"]).read_text()
-        self.assertIn('"event": "CLAIM"', ledger)
-        self.assertIn('"event": "RELEASE"', ledger)
+        alpha_events = [event["event"] for event in reversed(self.leases.history()) if event["device"] == "ALPHA"]
+        self.assertEqual(alpha_events, ["CLAIM", "RELEASE"])
+        self.assertIsNone(self.leases.current("BETA"))
+
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
+    def test_device_alias_cannot_bypass_an_existing_lease(self):
+        hosts = {**self.hosts, "alias": {**self.hosts["alpha"], "host_id": "alias"}}
+        self.config["shell_hosts"].append("alias")
+        write_policy(self.config_path, self.config)
+        broker = Broker(self.config_path, hosts=hosts, state_dir=self.state)
+        marker = self.root / "alias-marker"
+        with LedgerBroker({"alpha": Path(self.hosts["alpha"]["ledger"])}, state_dir=self.state).hold(
+                "alpha", owner="other-agent", scope="same physical device", worktree=str(self.root)):
+            result = broker.shell("alias", "touch '" + str(marker) + "'", request_id="alias-contention")
+            self.assertEqual(result["receipt"]["status"], "busy")
+            self.assertEqual(self.leases.current("ALPHA")["owner"], "other-agent")
+        self.assertFalse(marker.exists())
+
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
+    def test_service_operations_use_common_lease_root_not_the_operation_journal_directory(self):
+        from switchyard.core import Service
+        catalog = self.root / "catalog.json"
+        catalog.write_text(json.dumps({
+            "schema_version": 1, "provenance": "offline fixture", "workloads": [], "groups": [],
+            "devices": [{"id": name, "name": name, "platform": "linux", "architecture": "x86_64",
+                         "capabilities": [], "access": "declared-only", "observed_at": None,
+                         "provenance": "offline fixture", "notes": "No network transport"}
+                        for name in self.hosts]}))
+        collectors = self.root / "collectors.json"
+        collectors.write_text(json.dumps({"schema_version": 1, "hosts": list(self.hosts.values())}))
+        policy = self.root / "service-operations.json"
+        write_policy(policy, {"shell_hosts": ["alpha"], "workloads": {}})
+        service = Service(catalog, state_dir=self.state, collectors_path=collectors, operations_path=policy)
+        self.leases.break_device("ALPHA", reason="fixture operator block", operator="tester")
+        marker = self.root / "service-marker"
+        blocked = service.run_shell("alpha", "touch '" + str(marker) + "'", request_id="service-blocked")
+        self.assertEqual(blocked["receipt"]["status"], "busy")
+        self.assertFalse(marker.exists())
+        self.leases.clear("ALPHA", operator="tester", attest_stopped="fixture is stopped",
+                          expected_block=self.leases.block("ALPHA"))
+        succeeded = service.run_shell("alpha", "touch '" + str(marker) + "'", request_id="service-cleared")
+        self.assertEqual(succeeded["receipt"]["status"], "succeeded")
+        self.assertTrue(marker.exists())
+        events = [event["event"] for event in reversed(self.leases.history())]
+        self.assertEqual(events, ["BREAK", "CLEAR", "CLAIM", "RELEASE"])
+        self.assertEqual(len(list((self.state / "operations").rglob("operations.sqlite3"))), 1)
+        self.assertEqual(list((self.state / "operations").rglob("leases.sqlite3")), [])
 
     def test_plan_requires_real_approval_and_binds_content_and_configuration(self):
         plan = self.broker.plan("deploy", "foobar")
@@ -116,6 +212,7 @@ class BrokerTests(unittest.TestCase):
         write_policy(self.config_path, self.config)
         with self.assertRaisesRegex(ValueError, "changed"):
             self.broker.execute(plan["id"], approved=True, request_id="changed-config")
+        self.assertEqual(self.leases.history(), [])
 
     def test_plan_expiry_and_single_consumption(self):
         plan = self.broker.plan("deploy", "foobar")

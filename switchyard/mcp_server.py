@@ -99,8 +99,8 @@ def create_mcp(
         allowed=REMOTE_TOOLS if remote else None,
         instructions=(f"Remote Switchyard for agents on {origin_host}: cached reads and device leases only. Take a "
                       "lease (lease_hold) before any access from your host to another registry host and release it "
-                      "(lease_release) as soon as the work is done: holds from a remote host are TTL-only. Busy means "
-                      "wait or defer, never bypass. Edits, collection, operations and shell run on the control host."
+                      "(lease_release) once completion is confirmed. A missed deadline keeps the device reserved. "
+                      "Busy means wait or defer, never bypass. Edits, collection, operations and shell run on the control host."
                       if remote else
                       "Inventory and fleet read declarations/cache without contacting hosts. collect_host explicitly performs bounded read-only inspection. Legacy plan_migration is a non-executable proposal. operation_policy reports opt-in authority. plan_operation prepares an expiring exact plan; execute_operation needs explicit approval and a request ID. shell runs unrestricted unprivileged shell only on enrolled hosts with declared extra host leases. Never automatically retry execution or shell; inspect durable receipts after uncertain outcomes. No operations configuration means no execution authority."),
     )
@@ -125,16 +125,16 @@ def create_mcp(
 
     @mcp.tool(annotations=annotations())
     def device_locks() -> dict[str, Any]:
-        """Read local device-lock holders and ledger tails without taking leases or contacting hosts."""
+        """Read durable device reservations, suspect status, and recent events. Never acquires a lease or contacts a device."""
         return service.device_locks()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
     def lease_hold(device: ID, scope: Annotated[str, Field(strict=True, min_length=1, max_length=512)],
                    ttl_minutes: Annotated[int, Field(strict=True, ge=1, le=120)] = 60,
                    owner: Annotated[str, Field(strict=True, min_length=1, max_length=512)] | None = None) -> dict[str, Any]:
-        """Hold a canonical local device lock for multi-step agent work. Returns connection hints and expiry; release promptly. Coordination only, not device-operation authorization. On a remote-host server the hold is TTL-only (detached) and attributed to the calling host."""
+        """Reserve a device for multi-step work and return connection hints and a deadline. Release after confirmed completion. A missed deadline keeps it reserved. This does not authorize access."""
         if remote:
-            # The owning agent is on origin_host, invisible to this host: TTL-only, attributed there.
+            # The control host cannot observe the owning agent's process.
             return service.agent_leases().hold(device, scope=scope, ttl=ttl_minutes * 60, owner=owner, detached=True,
                                                worktree=f"{origin_host}:mcp", origin_host=origin_host,
                                                agent_id=agent_id, origin_user=origin_user)
@@ -142,12 +142,12 @@ def create_mcp(
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
     def lease_release(lease_id: ID) -> dict[str, Any]:
-        """Release only a Switchyard holder lease, never a raw-flock holder. Confirms its RELEASE."""
+        """Confirm completion and release a hold by its lease ID. Does not release an attached command."""
         return service.agent_leases().release(lease_id)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
     def lease_renew(lease_id: ID, ttl_minutes: Annotated[int, Field(strict=True, ge=1, le=120)]) -> dict[str, Any]:
-        """Extend an active Switchyard holder lease from now, within the two-hour TTL limit. Never contacts the device."""
+        """Extend an active hold's deadline. Never contacts the device or renews a suspect reservation."""
         return service.agent_leases().renew(lease_id, ttl=ttl_minutes * 60)
 
     @mcp.tool(annotations=annotations())

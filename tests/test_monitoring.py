@@ -78,11 +78,12 @@ class MonitoringTests(unittest.TestCase):
         monitor = Monitor(self.cache, configs())
         with patch("switchyard.monitoring.collector.collect_host", return_value=value) as collect:
             self.assertEqual(monitor._sample("host-0", "fast")[0], "partial")
-            collect.assert_called_once_with(record, mode="fast", previous=None)
+            collect.assert_called_once_with(record, mode="fast", previous=None, state_dir=self.cache.directory)
             saved = self.cache.read("host-0")["snapshot"]
             self.now += 10
             self.assertEqual(monitor._sample("host-0", "fast")[0], "partial")
             self.assertEqual(collect.call_args.kwargs["previous"], saved)
+            self.assertEqual(collect.call_args.kwargs["state_dir"], self.cache.directory)
         self.assertEqual(self.cache.read("host-0")["retry_after_seconds"], 0)
 
     def test_missed_deadlines_are_skipped_instead_of_caught_up(self):

@@ -9,7 +9,7 @@ before the first remote effect and after each stage. A stopped change continues 
 journal revision, so views that follow the broker revision notice route changes.
 
 Order of effects. Each Caddy and DNS change is an ordinary deploy refresh (inspection and apply receipts) that
-takes the host's canonical lease inside the deploy manager; this module holds only a local flock serializing
+takes its device lease inside the deploy manager; this module holds only a local flock serializing
 route changes, never a fleet lease and never a database write lock across remote calls.
   create/update: Caddy prepare (the new routes, plus the old name while renaming) -> leased HTTPS probe of every
                  route in that Caddyfile -> DNS (adds and removes in one refresh) -> Caddy cleanup (drops the old

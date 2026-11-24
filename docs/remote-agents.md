@@ -1,6 +1,6 @@
 # Device leases for agents on other hosts
 
-Agents on the control host take device locks with `switchyard lease`. Canonical ledgers and kernel flock live on that host only; agents elsewhere must request leases through it. The default ledger root is the XDG state root plus `switchyard/ledgers` (normally `~/.local/state/switchyard/ledgers`), overridden by `SWITCHYARD_LEDGER_DIR`. A remote copy of those files is not a lock.
+All callers use one Switchyard control host. Its SQLite database, not a kernel lock or a copied ledger, reserves each device. Callers on other hosts ask that authority for a lease.
 
 Hosts that have no SSH trust to the control host use the same client with an **API key** instead: `switchyard enroll` asks the Switchyard HTTPS listener for a key, the operator approves the request from any browser, and the client then reads state and takes leases over HTTPS (see "Keyed HTTPS access" below).
 
@@ -9,7 +9,7 @@ Hosts that have no SSH trust to the control host use the same client with an **A
 | Where | What |
 |---|---|
 | the control host | `switchyard lease attach`: a lease held for a caller on the other end of stdin (one SSH connection). It is released when the caller reports `done`, and kept fail-closed as *suspect* when the caller goes silent. |
-| the control host | `switchyard lease hold --detached`: a hold limited only by its TTL, for callers whose owning process is not on the control host. |
+| the control host | `switchyard lease hold --detached`: a reservation without a local process watcher. Its deadline marks it suspect rather than releasing it. |
 | the control host | `tools/install-agent-cli.sh`: installs `~/.local/bin/switchyard`, `switchyard-mcp` and `switchyard-mcp-remote` with uv's absolute path, so the wrappers work from non-interactive SSH. |
 | Other host | `tools/switchyard-remote`, installed as `~/.local/bin/switchyard`: a single file that uses only the Python 3 standard library (3.9 or newer). |
 | the control host → host | `tools/install-remote-client.sh <host-id>`: installs the client, its configuration and the agent guidance while holding that host's lease. |
@@ -21,21 +21,16 @@ switchyard lease attach <device> --scope S [--owner O] [--wait N] [--heartbeat S
     [--origin-host H [--agent-id PASEO_ID] [--origin-user U]] [--worktree W]
 ```
 
-- `attach` acquires the lease the same way as `run`, writes CLAIM, and prints one JSON line on stdout: `{"status": "claimed", "lease_id", "device", "expires_at", "env": {...}}`.
-- **Release means the command is confirmed finished.** A `done` line on stdin releases with reason `released`. So does `switchyard lease release <id>`. SIGTERM or SIGINT gives reason `signal`, and the 120-minute hard cap gives `expired`. After RELEASE, `attach` prints `{"status": "released", "lease_id", "device", "reason"}` (best effort) and exits 0. Attach leases cannot be renewed.
-- **Without `--heartbeat`** (manual use at a terminal on the control host), EOF on stdin also releases (`released`) and SIGHUP gives `signal`.
-- **With `--heartbeat N`**, which the remote client always passes (`60`), the caller sends a byte at least every N seconds. Losing contact is fail-closed:
-  - No byte for N seconds (cause `silent`), or EOF without `done` (cause `disconnected`), marks the lease **suspect**. The state file gets `suspect`, `suspect_since` and `suspect_cause`.
-  - The flock stays held and no RELEASE is written, because the remote command may still be touching the device.
-  - The holder ignores SIGHUP, and the CLI moves it into its own session (`setsid`), so SSH teardown cannot end it. With `KillUserProcesses=no` on the control host, logind does not kill it either.
-  - A suspect lease ends only by explicit `lease release <id>`, by SIGTERM to the attach process on the control host, or by the cap. Its RELEASE records `suspect_cause` and `suspect_since`, plus `released_after_loss: true` for an explicit release. A late `done` from a client that recovers also releases it.
-- **Visibility.** `lease status`/`list`, `/api/locks` and MCP `device_locks` include `suspect`, `suspect_since` and `suspect_cause` in `switchyard_lease`. Busy messages end with `connection lost <age> ago (<cause>), command state unknown; clear with switchyard lease release <id> once the remote command is confirmed stopped`.
-- **Clearing a suspect lease.** First confirm on the origin host that the command is not running. The client kills it when it dies, but see Limits. Then run `switchyard lease release <lease_id>`. If the attach process does not respond, or the holder is something else entirely, the operator uses `switchyard lease break <device> --reason …` at a terminal on the control host. Its RELEASE then carries reason `broken` plus the suspect cause, and the device stays blocked for new leases until `--attest-stopped` or `switchyard lease clear`. See [device access and breakglass](access.md#agent-leases-and-breakglass).
-- If the device is busy, `attach` exits 75. The holder message goes to stderr and nothing goes to stdout. If stdin closes while `--wait` is still polling a busy lock, `attach` gives up without a CLAIM and exits 1.
-- `lease hold ... --detached` drops the owner-exit watch. Release, the TTL and signals still end the hold. `--origin-host` requires `--detached` on `hold`.
+- `attach` durably reserves the device before printing `{"status": "claimed", "lease_id": "...", "device": "...", "expires_at": "...", "env": {...}}`.
+- A `done` line on that connection confirms completion of that grant. The control host replies `{"status": "released", "lease_id": "...", "device": "...", "reason": "released"}`.
+- EOF without `done`, a silent connection, holder death, or expiry without completion leave the lease **suspect**. No grant is issued for that device even after a coordinator restart.
+- A late `done` on the original channel is valid only for that grant. If that channel is gone, inspect the target; the operator clears the suspect with `lease clear --attest-stopped ...` only after confirming the old work stopped.
+- `lease status`/`list`, `/api/locks` and MCP `device_locks` retain the existing response shape and include suspect evidence.
+- If a device is busy, `attach` exits 75 without issuing a claim.
+- `lease hold ... --detached` drops the owner-exit watch. A signal or deadline does not confirm completion. `--origin-host` requires `--detached` on `hold`.
 - Owner attribution: `--origin-host` must be a registry host. `--agent-id` resolves to `"<agent name> (paseo:<id8>)@<host>"` through the cached Paseo agent names, but only when Switchyard saw that agent on that same host. An agent ID it has not seen gives `paseo:<id8>@<host>`. Without an agent ID the owner is `<user>@<host>`, and an explicit `--owner` becomes `<owner>@<host>`. The ledger's `via` field reads `switchyard lease attach from <host>` or `switchyard lease hold --detached from <host>`.
-- A detached hold also passes `PASEO_AGENT_ID` to its holder unit, so the locks view names the remote agent.
-- Busy messages prefer the owner of the matched Switchyard lease to the kernel holder's process name. For a remote lease that owner is `…@host-a`, where the process name would only say `python3`.
+- Detached holds record the caller directly in SQLite rather than starting a local process on its behalf.
+- Busy messages name the claimant and report when completion is unconfirmed.
 
 ## Client (other hosts)
 
@@ -57,21 +52,17 @@ switchyard hosts | fleet | definitions | operations [--id ID]                   
 switchyard mcp                                                                  # stdio MCP over ssh
 ```
 
-- **`lease run`** starts `ssh -T -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 <control> switchyard lease attach … --heartbeat 60` with a pipe on stdin. It waits at most `--wait` + 20 s for the claim line, then runs CMD locally.
+- **`lease run`** opens a heartbeat-enabled SSH `attach` and runs CMD locally after receiving the claim. The control host refuses older SSH clients that do not advertise the completion protocol. Update the installed client before cutover; the public command syntax is unchanged.
   - CMD runs in its own process group with `PR_SET_PDEATHSIG=SIGTERM`, so a crashed or killed client takes CMD down.
-  - CMD receives exactly `SWITCHYARD_LEASE_ID`, `SWITCHYARD_DEVICE` and either `ANDROID_SERIAL` or `SWITCHYARD_SSH_TARGET`/`SWITCHYARD_SSH_PORT`. Stale copies of these variables and `DEVICE_LOCK_FD` are removed from the inherited environment, and any other keys in the claim are ignored.
+  - CMD receives the same lease and connection hints. Stale values and `DEVICE_LOCK_FD` are removed before running it.
   - While CMD runs, the client writes a newline heartbeat every 15 s.
   - SIGINT, SIGTERM and SIGHUP are forwarded to CMD. The SSH process runs in its own session, so a terminal Ctrl-C reaches only CMD and never the lease connection.
-  - Once CMD has exited **and been reaped**, the client writes `done`, closes the pipe and waits up to 30 s for the `released` line. It then returns CMD's exit code. If the release is not confirmed, it releases explicitly (see below).
-  - If the client gives up before running CMD (signal, no claim in time), it also sends `done`, so a late claim is released at once.
-- **Exit codes:** CMD's own code; **75** busy, with the holder message passed through and nothing run; **76** lease lost while CMD ran; **255** control host unreachable, nothing run; **2** usage errors and refused commands.
-- **Lease lost (76).** This covers an SSH connection that dies, heartbeats that can no longer be written, and a control host that ends the lease early (cap or operator release). The client prints a loud `LEASE LOST` warning, then:
-  1. It sends SIGTERM to CMD's process group.
-  2. Ten seconds later it sends SIGKILL to anything still in that group, including descendants that outlived the leader, and waits until CMD is reaped.
-  3. Unless the control host already ended the lease, it reconnects and runs `lease release <lease_id>`: every 5 s, for up to 2 minutes.
-  4. It reports whether the release worked, was refused because the lease had already ended, or was left **suspect** on the control host.
-- **Attribution.** `lease run` and `lease hold` send `--origin-host <host_id>`, the caller's `--origin-user` and `--worktree <host>:<cwd>`. They also send `--agent-id` from `PASEO_AGENT_ID`, which Paseo sets for its agents and their child processes.
-- **Refused remotely:** `shell`, operations, registry and definition edits, the `web` command, `lease attach`/`_holder`, `lease break`/`clear` (an operator breakglass at a terminal on the control host only) and `--pass-lock-fd` (the locked descriptor exists only on the control host). Global options such as `--catalog` and `--state-dir` are also refused; the control host's wrapper sets them.
+  - A normal exit with no surviving process group confirms the command is done. The client sends `done`, closes the pipe and waits for the release acknowledgement. Signal termination or an SSH transport exit (255) alone is not proof of remote completion.
+  - If the client gives up before running CMD, it can send `done` because it knows nothing was dispatched.
+- **Exit codes:** CMD's own code; **75** busy, with the holder named and nothing run; **76** lease lost or completion unconfirmed after a zero exit; **255** SSH transport failure; **2** usage errors and refused commands.
+- **Lease lost (76).** The client terminates its local command and does not reconnect to automatically release the grant. A downstream operation may still be running despite successful local cleanup. Inspect the target and use the operator's attested recovery if needed.
+- **Attribution.** `lease run` and `lease hold` send the origin host/user, worktree and any `PASEO_AGENT_ID`.
+- **Refused remotely:** shell/operation mutations, registry and definition edits, `web`, `lease attach`/`_holder`, operator breakglass, and `--pass-lock-fd`. The control host's wrapper supplies global state options.
 - **Blocked devices.** After an operator's `lease break` without attestation, `lease run`/`hold` and MCP `lease_hold` get exit 75 with `<DEVICE> blocked: lease broken by … clear with switchyard lease clear …`. Defer and tell the user; only the operator clears it.
 - **Leasing the caller's own host** (`host-a` from host-a) works the same way. Use it to coordinate with control-host agents working on that host. Never lease `host-a` from inside a control-host-side `host-a` lease: that deadlocks.
 - **ADB.** `ANDROID_SERIAL` names a USB device on the control host, which is usually unreachable from another host.
@@ -87,7 +78,7 @@ Remote mode registers a fixed allowlist of tools, and only those:
 
 There are no host or definition edits, no collection, inspection or planning, and no execution or shell. A tool not on the list is never registered, so new tools stay local-only by default.
 
-In remote mode, `lease_hold` is always a detached (TTL-only) hold. It is attributed like the CLI (`<agent> (paseo:<id8>)@<host>` or `<user>@<host>`), with worktree `<host>:mcp`. The local `switchyard-mcp` keeps its full tool set.
+In remote mode, `lease_hold` is always detached. It is attributed like the CLI (`<agent> (paseo:<id8>)@<host>` or `<user>@<host>`), with worktree `<host>:mcp`. The local `switchyard-mcp` keeps its full tool set.
 
 ## Installing on a host
 
@@ -120,7 +111,7 @@ The marked block sits between `<!-- BEGIN switchyard-remote-device-locks … -->
 ### SSH leases or a key?
 
 - **SSH leases** (`switchyard lease run|hold …`) are the default wherever the host's SSH key is trusted on the control host. `lease run` holds the lease exactly for the command's lifetime, sends heartbeats, kills the command when the lease is lost (exit 76) and fails closed (*suspect*) when the connection dies. Prefer them.
-- **A key** (`switchyard enroll`) is for hosts without that SSH trust, for example a fresh host or a laptop that should only read. Keyed HTTP leases (`switchyard http-lease`) are TTL-only holds: nothing ties them to a running command. Release them yourself.
+- **A key** (`switchyard enroll`) is for hosts without SSH trust, for example a fresh host or a laptop that should only read. Keyed HTTP leases (`switchyard http-lease`) are detached: nothing ties them to a running command. Release them after confirming completion.
 
 Scopes are granted by the operator. A request can only narrow what it asks for.
 
@@ -200,11 +191,10 @@ The client refuses a key file that others can read. `SWITCHYARD_CONFIG_DIR` over
 ## Limits
 
 - This is coordination, not fencing. A remote agent that ignores exit 76 or bypasses the client is not stopped.
-- `PR_SET_PDEATHSIG` covers CMD itself, not processes it spawns. A daemonizing or double-forked descendant can outlive a killed client, which is exactly why the control host keeps such a lease suspect instead of releasing it.
-- A SIGSTOPped (or hung) client leaves CMD running; after 60 s of silence the control host marks the lease suspect while still holding the lock.
-- A detached hold that nobody releases blocks the device until its TTL expires, because the control host cannot see the remote process exit. A suspect attach lease blocks it until someone releases it or the 120-minute cap. Agents should prefer `lease run`.
-- Every command costs an SSH connection plus CLI startup on the control host; avoid using reads as a polling loop.
+- `PR_SET_PDEATHSIG` covers CMD itself, not every descendant or remote execution. A stuck client or command never causes a silent grant to someone else.
+- Detached holds cannot prove the claimant completed. The deadline marks them suspect; release explicitly when done, rather than relying on expiry.
+- Every command costs an SSH connection and CLI startup on the control host; avoid polling.
 - Claude Code's MCP configuration (`~/.claude.json`) is not edited. Claude Code agents use the CLI.
 - Enrollment trusts the first CA download unless `--ca-fingerprint` is given. Comparing the printed fingerprint, or the code on the Access page, is what catches interception on that first contact.
 - A key holder on an approved host is as trusted as that host. Anyone who can read `~/.config/switchyard/key` as that user can use the key until it expires or is revoked.
-- Keyed HTTP leases are not bound to a command or a connection: a forgotten `http-lease hold` blocks the device until its TTL. Use SSH `lease run` where it works.
+- Keyed HTTP leases are not bound to a command or connection. Release the exact hold after confirming completion; unattended expiry keeps it reserved. Prefer SSH `lease run` when a command can be bound to the lease.

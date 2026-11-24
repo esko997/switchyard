@@ -1,6 +1,5 @@
 """Operator-configured, bounded read-only local/SSH observation transport."""
 from contextlib import nullcontext
-from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
@@ -12,7 +11,7 @@ import signal
 import subprocess
 import time
 
-from .leases import LedgerBroker, LeaseBusy
+from .leases import LedgerBroker, LeaseBusy, mark_uncertain
 from .models import Snapshot
 from . import container_probe, host_keys, probe
 from . import host_context
@@ -47,8 +46,8 @@ def _canonical(path):
     if not isinstance(path, str) or len(path) > 4096:
         raise ValueError("Invalid ledger path")
     candidate = Path(path)
-    if not candidate.is_absolute() or candidate != candidate.resolve(strict=True) or not candidate.is_file():
-        raise ValueError("Ledger must be an existing canonical regular file")
+    if not candidate.is_absolute() or candidate != candidate.resolve() or ".." in candidate.parts:
+        raise ValueError("Expected a canonical lease resource path")
     return candidate
 
 
@@ -237,6 +236,16 @@ def _run(command, source, deadline):
                             if len(buffer) > (MAX_STDOUT if buffer is output else MAX_STDERR):
                                 raise CollectionError("Observation output limit exceeded")
             status = child.wait(timeout=max(0.001, deadline - time.monotonic()))
+        if command[0] == "ssh" and status == 255:
+            # OpenSSH emits this diagnostic before a session can dispatch a command.
+            # Any other 255 (including a dropped established channel) is ambiguous.
+            diagnostic = bytes(errors).strip()
+            pre_connection = (not output and b"\n" not in diagnostic
+                              and diagnostic.startswith((b"ssh: connect to host ", b"ssh: Could not resolve hostname ")))
+            if not pre_connection:
+                mark_uncertain("SSH observation completion unconfirmed")
+        elif status < 0:
+            mark_uncertain("observation process died by signal")
         return status, bytes(output)
     except subprocess.TimeoutExpired as error:
         raise CollectionError("Observation deadline exceeded") from error
@@ -372,24 +381,6 @@ def _validate_snapshot(data, config, *, mode="full"):
         raise CollectionError("Invalid observation response") from error
 
 
-def _receipt(ledger, config, outcome):
-    fd = os.open(ledger, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        record = {"at": datetime.now(timezone.utc).isoformat(), "event": "OBSERVATION",
-                  "host_id": config["host_id"], "collector": "linux-v1", "outcome": outcome,
-                  "scope": "read-only configured resource metadata and systemd allowlists; no changes"}
-        encoded = (json.dumps(record) + "\n").encode()
-        view = memoryview(encoded)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("receipt append failed")
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _apply_cpu_delta(snapshot, previous):
     """Compare only validated counters from the same boot; never sleep."""
     current = snapshot["cpu"].get("counters")
@@ -409,7 +400,7 @@ def _apply_cpu_delta(snapshot, previous):
     return Snapshot.model_validate(snapshot).model_dump()
 
 
-def collect_host(config: dict, *, mode="full", previous=None) -> dict:
+def collect_host(config: dict, *, mode="full", previous=None, state_dir=None) -> dict:
     started = time.monotonic()
     try:
         if mode not in {"full", "fast", "storage"}:
@@ -419,17 +410,17 @@ def collect_host(config: dict, *, mode="full", previous=None) -> dict:
             if mode != "full":
                 raise ValueError("Android supports manual full observation only")
             from .android import collect_host as collect_android
-            return collect_android(config)
+            return collect_android(config, state_dir=state_dir)
         source = _probe_source(config, mode=mode)
         if config["transport"] == "ssh":
             command = _ssh_command(config)
-            lease = LedgerBroker({config["host_id"]: Path(config["ledger"])}).hold(
+            lease = LedgerBroker({config["host_id"]: Path(config["ledger"])}, state_dir=state_dir).hold(
                 config["host_id"], owner="switchyard", scope="read-only observation; configured unit allowlists",
                 worktree=str(Path(__file__).resolve().parents[1]))
         else:
             command = None
-            lease = nullcontext()
-        with lease:
+            lease = nullcontext(None)
+        with lease as receipt:
             outcome = "failed"
             try:
                 extended = mode == "full" and bool(config.get("paseo", {}).get("cli"))
@@ -439,24 +430,29 @@ def collect_host(config: dict, *, mode="full", previous=None) -> dict:
                         status, output = _run(local_command, local_source, started + budget)
                 else:
                     status, output = _run(command, source, started + budget)
-                if status != 0:
-                    raise CollectionError("Observation transport or probe failed")
-                snapshot = _validate_snapshot(output, config, mode=mode)
-                if mode == "fast":
-                    snapshot = _apply_cpu_delta(snapshot, previous)
-                outcome = {"observed_at": snapshot["observed_at"], "coverage": snapshot["coverage"],
-                           "snapshot_sha256": hashlib.sha256(output).hexdigest()}
-                return snapshot
+                try:
+                    if status != 0:
+                        raise CollectionError("Observation transport or probe failed")
+                    snapshot = _validate_snapshot(output, config, mode=mode)
+                    if mode == "fast":
+                        snapshot = _apply_cpu_delta(snapshot, previous)
+                except CollectionError as error:
+                    failure = error
+                else:
+                    outcome = {"observed_at": snapshot["observed_at"], "coverage": snapshot["coverage"],
+                               "snapshot_sha256": hashlib.sha256(output).hexdigest()}
+                    return snapshot
             finally:
-                if config["transport"] == "ssh":
-                    _receipt(config["ledger"], config, outcome)
+                if receipt is not None:
+                    receipt["release"]["observation"] = outcome
+        raise failure
     except (CollectionError, LeaseBusy):
         raise
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
         raise CollectionError("Observation configuration or transport unavailable") from error
 
 
-def scan_host_key(config, *, address, port):
+def scan_host_key(config, *, address, port, state_dir=None):
     """Scan under the collection lease; returned public keys are not trusted."""
     started = time.monotonic()
     try:
@@ -469,17 +465,21 @@ def scan_host_key(config, *, address, port):
             raise ValueError("Host key scan must match the configured target and port")
         command = ["ssh-keyscan", "-T", "5", "-p", str(port), "-t", "ed25519,ecdsa,rsa", address]
         source = b""
-        lease = LedgerBroker({config["host_id"]: Path(config["ledger"])}).hold(
+        lease = LedgerBroker({config["host_id"]: Path(config["ledger"])}, state_dir=state_dir).hold(
             config["host_id"], owner="switchyard", scope="read-only host-key scan; no trust granted",
             worktree=str(Path(__file__).resolve().parents[1]))
         with lease:
             status, output = _run(command, source, started + 8)
-            if status != 0:
-                raise CollectionError("Host key scan unavailable")
-            keys = host_keys.parse_keys(output.decode("utf-8"))
-            if not keys or len(keys) > 32:
-                raise CollectionError("Host key scan returned no usable identity")
-            return {"keys": keys, "fingerprints": [host_keys.fingerprint(key) for key in keys]}
+            if status == 0:
+                try:
+                    keys = host_keys.parse_keys(output.decode("utf-8"))
+                except (UnicodeError, ValueError):
+                    keys = []
+            else:
+                keys = []
+        if not keys or len(keys) > 32:
+            raise CollectionError("Host key scan returned no usable identity")
+        return {"keys": keys, "fingerprints": [host_keys.fingerprint(key) for key in keys]}
     except (CollectionError, LeaseBusy):
         raise
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:

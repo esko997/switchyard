@@ -1,6 +1,5 @@
 """Integrated execution fixtures: no systemd manager, hardware or network probes."""
 from contextlib import ExitStack
-import fcntl
 import os
 from pathlib import Path
 import platform
@@ -12,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from switchyard import collector, host_context, remote
+from switchyard.lease_db import LeaseStore
 from switchyard.leases import LedgerBroker
 
 
@@ -33,30 +33,27 @@ class HostContextTests(unittest.TestCase):
             with host_context.execution(b"", timeout=2):
                 self.fail("Invalid opt-in accepted")
 
-    def test_source_is_independently_compiled_and_fd_count_is_bounded(self):
+    def test_source_is_independently_compiled(self):
         with host_context.execution(b"from __future__ import annotations\nprint('future')", timeout=2) as (_, source):
             status, output = remote.run_bounded([sys.executable, "-I", "-S", "-"], source, timeout=3)
             self.assertEqual((status, output), (0, b"future\n"))
         with self.assertRaisesRegex(ValueError, "must be bytes"):
             with host_context.execution("not bytes", timeout=2):
                 self.fail("Text source accepted")
-        with patch.object(host_context, "held_ledgers", return_value=({},) * 254), self.assertRaisesRegex(ValueError, "Too many"):
-            with host_context.execution(b"", timeout=2):
-                self.fail("Too many descriptors accepted")
 
     def test_normal_transport_return_also_confirms_stop_before_release(self):
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "ledger"
-            path.write_text("baseline\n")
-            with LedgerBroker({"fixture": path}).hold("fixture", owner="fixture", scope="test", worktree=root):
+            store = LeaseStore(Path(root) / "leases")
+            with LedgerBroker({"fixture": Path(root) / "metadata"}, state_dir=root).hold(
+                    "fixture", owner="fixture", scope="test", worktree=root):
                 with host_context.execution(b"print('done')", timeout=2) as (_, source):
                     status, output = remote.run_bounded([sys.executable, "-I", "-S", "-"], source, timeout=3)
                     self.assertEqual((status, output), (0, b"done\n"))
                 host_context._cancel.assert_called_once()
-                self.assertNotIn('"event": "RELEASE"', path.read_text())
-            self.assertIn('"event": "RELEASE"', path.read_text())
+                self.assertIsNotNone(store.current("FIXTURE"))
+            self.assertIsNone(store.current("FIXTURE"))
 
-    def test_fixed_payload_uses_host_python_foreground_unit_and_fd_handshake(self):
+    def test_fixed_payload_uses_host_python_foreground_unit(self):
         with host_context.execution(b"print('ready')", timeout=2.1) as (argv, source):
             for flag in ("--user", "--pipe", "--wait", "--collect", "--quiet", "--property=RuntimeMaxSec=3",
                          "--property=KillMode=control-group", "--property=TimeoutStopSec=5"):
@@ -100,58 +97,19 @@ class HostContextTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "systemd-run")
         self.assertEqual(config["transport"], "local")
 
-    def test_unconfirmed_cancellation_keeps_all_same_inode_flocks_on_host(self):
+    def test_unconfirmed_unit_exit_keeps_the_durable_reservation(self):
         with tempfile.TemporaryDirectory() as root:
-            paths = [Path(root) / name for name in ("one", "two")]
-            for path in paths:
-                path.write_text("baseline\n")
-            child = None
-            try:
-                with patch.object(host_context, "_cancel", return_value=False) as cancel:
-                    with self.assertRaises(InterruptedError), ExitStack() as leases:
-                        for path in paths:
-                            leases.enter_context(LedgerBroker({path.name: path}).hold(path.name, owner="fixture", scope="test", worktree=root))
-                        with host_context.execution(b"import time\nprint('ready', flush=True)\ntime.sleep(30)", timeout=2) as (_, source):
-                            child = subprocess.Popen([sys.executable, "-I", "-S", "-"], stdin=subprocess.PIPE,
-                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            child.stdin.write(source)
-                            child.stdin.close()
-                            self.assertEqual(child.stdout.readline(), b"ready\n")
-                            raise InterruptedError("fixture cancellation")
-                    cancel.assert_called_once()
-                for path in paths:
-                    with path.open("a") as contender:
-                        with self.assertRaises(BlockingIOError):
-                            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertNotIn('"event": "RELEASE"', path.read_text())
-            finally:
-                if child is not None:
-                    child.terminate()
-                    child.wait(timeout=5)
-                    child.stdout.close()
-                    child.stderr.close()
-            for path in paths:
-                with path.open("a") as contender:
-                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def test_confirmed_cancellation_precedes_ledger_release(self):
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "ledger"
-            path.write_text("baseline\n")
-
-            def stop(unit):
-                self.assertNotIn('"event": "RELEASE"', path.read_text())
-                with path.open("a") as contender:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return True
-
-            with patch.object(host_context, "_cancel", side_effect=stop) as cancel:
-                with self.assertRaises(InterruptedError), LedgerBroker({"fixture": path}).hold("fixture", owner="fixture", scope="test", worktree=root):
-                    with host_context.execution(b"", timeout=2):
-                        raise InterruptedError("fixture cancellation")
-            cancel.assert_called_once()
-            self.assertIn('"event": "RELEASE"', path.read_text())
+            paths = {name: Path(root) / name for name in ("one", "two")}
+            store = LeaseStore(Path(root) / "leases")
+            with patch.object(host_context, "_cancel", return_value=False), ExitStack() as leases:
+                for name, path in paths.items():
+                    leases.enter_context(LedgerBroker({name: path}, state_dir=root).hold(
+                        name, owner="fixture", scope="test", worktree=root))
+                with host_context.execution(b"print('complete')", timeout=2) as (_, source):
+                    status, output = remote.run_bounded([sys.executable, "-I", "-S", "-"], source, timeout=3)
+                    self.assertEqual((status, output), (0, b"complete\n"))
+            for name in paths:
+                self.assertEqual(store.current(name.upper())["suspect_cause"], "host unit termination unconfirmed")
 
     def test_cancel_requires_sync_stop_or_confirmed_unloaded_unit(self):
         success = subprocess.CompletedProcess([], 0, b"")

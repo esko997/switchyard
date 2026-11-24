@@ -148,16 +148,16 @@ def main():
         sub.add_argument("--worktree")
         sub.add_argument("--wait", type=float, default=0)
         if action == "run":
-            sub.add_argument("--pass-lock-fd", action="store_true",
-                             help="Give the command the locked ledger descriptor as DEVICE_LOCK_FD (scripts that verify an inherited lock)")
+            sub.add_argument("--pass-lock-fd", action="store_true", help=argparse.SUPPRESS)
             continue
         if action == "hold":
             sub.add_argument("--ttl", default="60m")
             sub.add_argument("--detached", action="store_true",
-                             help="TTL-only hold for a caller whose owning process is not on this host (no owner-exit watch)")
+                             help="Hold for a caller on another host (no local owner-exit watch)")
         else:
             sub.add_argument("--heartbeat", type=float,
-                             help="Release with reason `lost` when stdin is silent this many seconds (1-600)")
+                             help="Mark completion unconfirmed if stdin is silent this many seconds (1-600)")
+            sub.add_argument("--completion-proof", action="store_true", help=argparse.SUPPRESS)
         # Remote callers (switchyard-remote on another registry host) attribute the lease to their agent.
         sub.add_argument("--agent-id", help="Paseo agent ID on --origin-host")
         sub.add_argument("--origin-host", help="Registry host ID the caller runs on")
@@ -172,18 +172,23 @@ def main():
     status = leases.add_parser("status")
     status.add_argument("device")
     # Operator breakglass: human-only (refused under any agent ancestry), confirmed by typing the label.
-    breaking = leases.add_parser("break", help="Operator only: revoke a stuck or suspect lease and prove the lock is gone")
+    breaking = leases.add_parser("break", help="Operator only: block new grants while investigating unresolved work")
     breaking.add_argument("device")
     breaking.add_argument("--reason", required=True)
-    breaking.add_argument("--signal-holders", action="store_true",
-                          help="SIGTERM foreign processes holding the ledger descriptor (never agent sessions)")
-    breaking.add_argument("--kill", action="store_true", help="With --signal-holders: SIGKILL holders still alive after 10 s")
+    breaking.add_argument("--signal-holders", action="store_true", help=argparse.SUPPRESS)
+    breaking.add_argument("--kill", action="store_true", help=argparse.SUPPRESS)
     breaking.add_argument("--attest-stopped", help="How you know the old operation no longer touches the device (no block)")
     breaking.add_argument("--yes-device", help="Non-interactive confirmation: the exact ledger label")
-    clearing = leases.add_parser("clear", help="Operator only: lift a `lease break` block once the old operation is stopped")
+    clearing = leases.add_parser("clear", help="Operator only: clear a block or suspect lease after attesting that work stopped")
     clearing.add_argument("device")
     clearing.add_argument("--attest-stopped", required=True, help="How you know the old operation no longer touches the device")
     clearing.add_argument("--yes-device", help="Non-interactive confirmation: the exact ledger label")
+    migration = leases.add_parser("migrate", help="Import quiesced legacy leases and audit history into SQLite")
+    migration.add_argument("--legacy-ledger", action="append", default=[], metavar="LABEL=/PATH",
+                           help="Import an additional explicitly configured legacy ledger")
+    mode = migration.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="Read legacy state without writing anything")
+    mode.add_argument("--confirm-drained", action="store_true", help="Old lease writers have been stopped and cannot restart")
     holder = leases.add_parser("_holder", help=argparse.SUPPRESS)
     holder.add_argument("lease_id")
     # argparse.REMAINDER would swallow --scope after the device positional.
@@ -199,11 +204,19 @@ def main():
         args.catalog = args.catalog or os.environ.get("SWITCHYARD_CATALOG")
         args.collectors = args.collectors or os.environ.get("SWITCHYARD_COLLECTORS")
         args.operations = args.operations or os.environ.get("SWITCHYARD_OPERATIONS")
-    if not args.catalog and not (args.command == "lease" and args.lease_command == "_holder"):
+    if not args.catalog and not (args.command == "lease" and args.lease_command in {"_holder", "migrate"}):
         parser.error("--catalog is required (lease also accepts SWITCHYARD_CATALOG)")
     if args.command == "monitor" and args.cycles is not None and args.cycles < 1:
         parser.error("--cycles must be a positive integer")
     try:
+        if args.command == "lease" and args.lease_command == "migrate":
+            from .agent_leases import agent_ancestry, state_root
+            from .lease_migration import migrate
+            if not args.dry_run and agent_ancestry():
+                raise ValueError("Lease migration is operator-only; stop every old lease writer first")
+            print(json.dumps(migrate(args.state_dir or state_root(), legacy_ledgers=args.legacy_ledger,
+                                     dry_run=args.dry_run), indent=2))
+            return
         if args.command == "lease" and args.lease_command == "_holder":
             from .agent_leases import holder_main, state_root
             holder_main(args.state_dir or state_root(), args.lease_id)
@@ -251,7 +264,8 @@ def main():
                         pass
                 raise SystemExit(manager.attach(args.device, scope=args.scope, owner=args.owner, worktree=args.worktree,
                                                 wait=args.wait, agent_id=args.agent_id, origin_host=args.origin_host,
-                                                origin_user=args.origin_user, heartbeat=args.heartbeat))
+                                                origin_user=args.origin_user, heartbeat=args.heartbeat,
+                                                completion_proof=args.completion_proof))
             if args.lease_command == "hold":
                 result = manager.hold(args.device, scope=args.scope, owner=args.owner, worktree=args.worktree,
                                       ttl=ttl_seconds(args.ttl), wait=args.wait, detached=args.detached,
@@ -296,7 +310,7 @@ def main():
                             line += "; " + blocked_message(row["device"], row["blocked"])
                         lease_state = row.get("switchyard_lease")
                         if lease_state:
-                            line += f"; lease {lease_state['lease_id']}; expires {lease_state.get('expires_at') or 'at command completion'}"
+                            line += f"; lease {lease_state['lease_id']}; deadline {lease_state.get('expires_at') or 'command completion'}"
                         print(line)
                     return
             print(json.dumps(result, indent=2))
@@ -324,21 +338,7 @@ def main():
             if len(args.record_json.encode("utf-8")) > 65536:
                 raise ValueError("host record exceeds 64 KiB")
             record = json.loads(args.record_json)
-            # Every registry host is leaseable: give it its canonical ledger (create-only). A collector must
-            # name an existing ledger, so when the record names the host's own canonical ledger it is created
-            # first; any other ledger path must already exist.
-            from . import locks
-            from .agent_leases import ensure_ledger, host_label
-            declared = (record.get("collector") or {}).get("ledger") if isinstance(record, dict) else None
-            ledger = None
-            if isinstance(declared, str) and isinstance(record.get("id"), str) and Path(declared).resolve() == (
-                    Path(locks.DEFAULT_LEDGER_DIR).resolve() / f"DEVICE_ACCESS_{host_label(record['id'])}.md"):
-                ledger = ensure_ledger(record["id"])
             result = service.add_host(record, expected_revision=args.expected_revision)
-            if not declared:
-                ledger = ensure_ledger(record["id"])
-            if ledger:
-                result["ledger"] = {"path": str(ledger[0]), "created": ledger[1]}
         elif args.command == "ansible":
             result = ansible_ops.handle_cli(args, service)
         elif args.command in {"spec", "template", "deploy"}:

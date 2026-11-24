@@ -22,10 +22,11 @@ _SLOTS = threading.BoundedSemaphore(2)
 
 
 class Broker:
-    def __init__(self, config_path, *, hosts: dict, state_dir: Path):
+    def __init__(self, config_path, *, hosts: dict, state_dir: Path, lease_state_dir: Path | None = None):
         self.config_path = Path(config_path) if config_path is not None else None
         self.hosts = {key: dict(value) for key, value in hosts.items()}
         self.store = Store(state_dir)
+        self.lease_state_dir = Path(lease_state_dir if lease_state_dir is not None else state_dir).resolve()
         self._configuration()
 
     def _configuration(self):
@@ -93,7 +94,7 @@ class Broker:
             host = self.hosts.get(host_id)
             if host is None or host.get("transport") != "ssh":
                 raise ValueError("Operations require an enrolled SSH host")
-            _validate_config(host)  # Revalidate canonical device ledgers.
+            _validate_config(host)  # Revalidate the target and its declared resource identity.
         return value
 
     def operation_hosts(self, config):
@@ -378,7 +379,8 @@ class Broker:
                 final = self.store.finish(db, operation_id, {"status": "failed",
                     "error": "Host authority changed before dispatch; no remote command executed"})
             return {"receipt": final}
-        payload.update(operation_id=operation_id, state_dir=str(self.store.directory), hosts=hosts)
+        payload.update(operation_id=operation_id, state_dir=str(self.store.directory),
+                       lease_state_dir=str(self.lease_state_dir), hosts=hosts)
         root = str(Path(__file__).resolve().parents[1])
         command = [sys.executable, "-I", "-c", "import sys; sys.path.insert(0," + repr(root)
                    + "); from switchyard.operation_worker import main; main()"]

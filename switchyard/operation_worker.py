@@ -7,19 +7,15 @@ import signal
 import sys
 import time
 
-from .agent_leases import block_for_ledger, blocked_message
 from .collector import _json, _validate_config
-from .leases import LedgerBroker, LeaseBusy
+from .lease_db import resource_label
+from .leases import LedgerBroker, LeaseBusy, mark_uncertain
 from .operation_store import Store, digest, process_identity
 from .remote import MAX_INPUT, RemoteError, SHELL_SOURCE, run_remote
 
 
-class DeviceBlocked(LeaseBusy):
-    """The operator broke a lease on this device and has not cleared it (see `switchyard lease break`)."""
-
-
 def operation_lease_wait():
-    """Seconds an operation polls for a busy canonical ledger before reporting busy (default 10, 0-600).
+    """Seconds an operation waits for a busy device before reporting busy (default 10, 0-600).
     The monitor's sub-second observation leases collide often; nothing has executed while waiting."""
     value = float(os.environ.get("SWITCHYARD_OPERATION_LEASE_WAIT", "10"))
     if not 0 <= value <= 600:
@@ -55,20 +51,19 @@ def main():
     returned = {"operation_id": operation_id}
     try:
         hosts = {key: _validate_config(value) for key, value in payload["hosts"].items()}
-        ordered = sorted(hosts.values(), key=lambda host: host["ledger"])
+        ordered = sorted(hosts.values(), key=lambda host: resource_label(host["host_id"], host["ledger"]))
         wait = operation_lease_wait()
         with ExitStack() as leases:
-            for host in ordered:
-                leases.enter_context(LedgerBroker({host["host_id"]: Path(host["ledger"])}).hold(
-                    host["host_id"], owner="switchyard", scope="operation=" + operation_id + "; consult private receipt",
-                    worktree=str(Path(__file__).resolve().parents[1]), wait=wait))
-            # A device the operator broke a lease on stays off-limits until `lease clear`: checked while
-            # holding its ledger, so a concurrent break cannot slip between the check and the work.
-            lease_state = Path(payload["state_dir"]).parent / "leases"
-            for host in ordered:
-                block = block_for_ledger(lease_state, host["ledger"])
-                if block:
-                    raise DeviceBlocked(blocked_message(Path(host["ledger"]).name[len("DEVICE_ACCESS_"):-3], block))
+            try:
+                for host in ordered:
+                    leases.enter_context(LedgerBroker({host["host_id"]: Path(host["ledger"])},
+                                                      state_dir=payload["lease_state_dir"]).hold(
+                        host["host_id"], owner="switchyard", scope="operation=" + operation_id + "; consult private receipt",
+                        worktree=str(Path(__file__).resolve().parents[1]), wait=wait))
+            except BaseException:
+                # No host action was dispatched. Earlier grants in this batch can end normally.
+                leases.close()
+                raise
             store.event(operation_id, "leases-acquired", {"host_ids": sorted(hosts)})
             if payload["kind"] == "shell":
                 store.event(operation_id, "shell-dispatched", {
@@ -77,6 +72,8 @@ def main():
                 result = run_remote(hosts[payload["host_id"]], SHELL_SOURCE,
                                     {"script": payload["script"], "timeout_seconds": payload["timeout_seconds"]},
                                     timeout=payload["timeout_seconds"] + 5)
+                if result.get("status") == "needs-inspection":
+                    mark_uncertain("shell completion unconfirmed", resource=payload["host_id"])
                 if result.get("status") not in {"succeeded", "failed", "needs-inspection"}:
                     raise RemoteError("Invalid shell result; effects need inspection")
                 for key in ("stdout", "stderr"):
@@ -123,10 +120,8 @@ def main():
                 raise ValueError("Unknown internal operation kind")
             with store.transaction() as db:
                 store.finish(db, operation_id, result)
-    except DeviceBlocked as error:
+    except LeaseBusy as error:
         result = {"status": "busy", "error": str(error)[:500] + "; no remote command executed"}
-    except LeaseBusy:
-        result = {"status": "busy", "error": "A canonical host lease is busy; no remote command executed"}
     except (RemoteError, InterruptedError):
         result = {"status": "needs-inspection", "error": "Operation transport interrupted; remote effects need inspection; no automatic retry"}
     except Exception:

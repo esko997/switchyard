@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from switchyard.broker import Broker
 from switchyard import fleet_keys, operation_worker
+from switchyard.lease_db import resource_label
+from switchyard.leases import LedgerBroker
 from switchyard.operation_store import digest, encode
 from switchyard.remote import RemoteError
 
@@ -23,7 +25,8 @@ def key(seed):
 
 
 class Network:
-    def __init__(self):
+    def __init__(self, lease_store):
+        self.lease_store = lease_store
         self.records = {name: {"keys": {}, "grants": [], "peers": [], "generation": None, "serial": 0}
                         for name in ("alpha", "beta", "gamma")}
         self.offline = set()
@@ -40,15 +43,13 @@ class Network:
 
     def call(self, host, source, request, **kwargs):
         name = host["host_id"]
-        # Every source/destination lease must stay held even during direct peer verification.
-        for enrolled in self.active_hosts.values():
-            with open(enrolled["ledger"], "a") as stream:
-                try:
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    pass
-                else:
-                    raise AssertionError("A whole-operation canonical lease was released")
+        # Every source/destination reservation survives direct peer verification.
+        for host_id, enrolled in self.active_hosts.items():
+            current = self.lease_store.current(resource_label(host_id, enrolled["ledger"]))
+            if current is None or current["status"] not in {"claimed", "suspect"}:
+                raise AssertionError("A whole-operation durable lease was released")
+            if current["owner"] != "switchyard":
+                raise AssertionError("The operation does not own its device reservation")
         self.trace.append((name, request.copy()))
         if name in self.offline:
             raise RemoteError("Fixture offline")
@@ -88,14 +89,16 @@ class FleetKeyTests(unittest.TestCase):
         self.hosts = {}
         for name in ("alpha", "beta", "gamma"):
             ledger = self.root / name
-            ledger.write_text("baseline\n")
             self.hosts[name] = {"host_id": name, "transport": "ssh", "target": "fixture@" + name,
                                 "expected_hostname": name, "ledger": str(ledger), "user_units": [], "system_units": []}
         self.config_path = self.root / "operations.json"
         self.config = {"schema_version": 2, "shell_hosts": [], "workloads": {}, "fleet_key_hosts": list(self.hosts)}
         self.config_path.write_text(json.dumps(self.config))
         self.broker = Broker(self.config_path, hosts=self.hosts, state_dir=self.root / "state")
-        self.network = Network()
+        self.leases = LedgerBroker({name: Path(host["ledger"]) for name, host in self.hosts.items()},
+                                   state_dir=self.broker.lease_state_dir)
+        self.lease_store = self.leases.store
+        self.network = Network(self.lease_store)
         self.sequence = 0
         for number in (signal.SIGTERM, signal.SIGINT):
             self.addCleanup(signal.signal, number, signal.getsignal(number))
@@ -106,7 +109,8 @@ class FleetKeyTests(unittest.TestCase):
     def dispatch(self, receipt, payload):
         hosts = payload.pop("operation_hosts", self.hosts)
         payload.update(hosts={name: hosts[name] for name in receipt["host_ids"]},
-                       operation_id=receipt["id"], state_dir=str(self.broker.store.directory))
+                       operation_id=receipt["id"], state_dir=str(self.broker.store.directory),
+                       lease_state_dir=str(self.broker.lease_state_dir))
         self.network.active_hosts = payload["hosts"]
         stdin = type("Input", (), {"buffer": io.BytesIO(encode(payload).encode())})()
         output = io.StringIO()
@@ -128,6 +132,27 @@ class FleetKeyTests(unittest.TestCase):
         with self.broker.store.transaction() as db:
             return fleet_keys.load(db)
 
+    def attest_uncertain_leases(self, *host_ids):
+        # Offline fixture only: emulate inspection and an operator's stopped-work attestation.
+        for host_id in host_ids:
+            host = self.hosts[host_id]
+            current = self.lease_store.current(resource_label(host_id, host["ledger"]))
+            self.assertIsNotNone(current)
+            self.assertEqual(current["status"], "suspect")
+        for host_id, host in self.hosts.items():
+            label = resource_label(host_id, host["ledger"])
+            current = self.lease_store.current(label)
+            if current is None:
+                continue
+            self.assertEqual(current["status"], "suspect")
+            block = self.lease_store.break_device(
+                label, reason="Inspected isolated fixture effects", operator="fixture operator",
+                expected_id=current["lease_id"])
+            self.lease_store.clear(
+                label, operator="fixture operator", expected_block=block,
+                attest_stopped="Inspected fixture transport and remote state; no work remains")
+            self.assertIsNone(self.lease_store.current(label))
+
     def enroll(self):
         self.inspect()
         result = self.apply("enroll", ["alpha", "beta"])
@@ -141,6 +166,9 @@ class FleetKeyTests(unittest.TestCase):
         self.inspect()
         self.assertTrue(all(request["action"] == "inspect" for _, request in self.network.trace))
         self.assertTrue(all(not record["keys"] for record in self.network.records.values()))
+        self.assertTrue(all(not Path(host["ledger"]).exists() for host in self.hosts.values()))
+        self.assertTrue(all(self.lease_store.current(resource_label(name, host["ledger"])) is None
+                            for name, host in self.hosts.items()))
         disabled = Broker(None, hosts=self.hosts, state_dir=self.root / "state")
         self.assertFalse(disabled.fleet_keys()["enabled"])
         self.assertEqual(len(disabled.fleet_keys()["hosts"]), 2)
@@ -172,6 +200,7 @@ class FleetKeyTests(unittest.TestCase):
         restarted = Broker(None, hosts=self.hosts, state_dir=self.root / "state")
         self.assertEqual(restarted.fleet_keys()["members"], ["beta"])
         self.network.offline.clear()
+        self.attest_uncertain_leases("beta")
         self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "succeeded")
 
     def test_rotation_keeps_old_grants_until_new_full_mesh_verifies(self):
@@ -185,6 +214,7 @@ class FleetKeyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.broker.plan_fleet_keys("rotate", ["alpha"])
         self.network.offline.clear()
+        self.attest_uncertain_leases("beta")
         self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "succeeded")
         self.assertNotIn("retiring", self.state()["hosts"]["alpha"])
         self.assertNotIn(old_key, self.network.records["beta"]["grants"])
@@ -212,6 +242,7 @@ class FleetKeyTests(unittest.TestCase):
         self.assertEqual(self.apply("rotate", ["alpha"])["receipt"]["status"], "needs-inspection")
         self.assertTrue(self.state()["retirement_started"])
         self.assertNotIn(old_key, self.network.records["beta"]["grants"])
+        self.attest_uncertain_leases("beta")
         self.inspect()
         self.network.trace.clear()
         self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "succeeded")
@@ -236,6 +267,7 @@ class FleetKeyTests(unittest.TestCase):
         generation = self.state()["hosts"]["alpha"]["generation"]
         old_key = self.network.records["alpha"]["keys"][generation]
         self.assertIn(old_key, self.network.records["beta"]["grants"])
+        self.attest_uncertain_leases("gamma")
         self.assertEqual(self.apply("remove", ["alpha"])["receipt"]["status"], "needs-inspection")
         self.assertNotIn(old_key, self.network.records["beta"]["grants"])
         self.assertEqual(self.state()["members"], ["beta", "gamma"])
@@ -262,6 +294,7 @@ class FleetKeyTests(unittest.TestCase):
         self.assertTrue(all(not record["keys"] for record in self.network.records.values()))
         self.assertTrue(all(request["action"] == "inspect" for _, request in self.network.trace))
 
+    @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_uncertain_identity_creation_is_durable_and_requires_explicit_reinspection(self):
         self.inspect()
         self.network.interrupt_after_write = ("alpha", "identity")
@@ -270,6 +303,10 @@ class FleetKeyTests(unittest.TestCase):
         generation = self.state()["hosts"]["alpha"]["generation"]
         self.assertIn(generation, self.network.records["alpha"]["keys"])
         self.assertEqual(self.state()["members"], ["alpha", "beta"])
+        before = len(self.network.trace)
+        self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "busy")
+        self.assertEqual(len(self.network.trace), before)
+        self.attest_uncertain_leases("alpha")
         self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "failed")
         self.inspect()
         self.assertEqual(self.apply("reconcile", [])["receipt"]["status"], "succeeded")
@@ -311,11 +348,13 @@ class FleetKeyTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_busy_canonical_lease_prevents_every_remote_command(self):
-        with open(self.hosts["beta"]["ledger"], "a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.leases.hold("beta", owner="fixture blocker", scope="busy device test",
+                              worktree=str(self.root)):
             result = self.inspect()
         self.assertEqual(result["receipt"]["status"], "busy")
         self.assertEqual(self.network.trace, [])
+        self.assertIsNone(self.lease_store.current(resource_label("alpha", self.hosts["alpha"]["ledger"])))
+        self.assertIsNone(self.lease_store.current(resource_label("beta", self.hosts["beta"]["ledger"])))
 
     def test_state_lease_prevents_disjoint_inspection_lost_updates(self):
         with open(self.broker.store.directory / "fleet-keys.lock", "a") as stream:

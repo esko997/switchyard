@@ -7,7 +7,7 @@ usage() {
 Usage:
   run-container.sh demo [--image IMAGE] [--port PORT] [--name NAME]
   run-container.sh integrated --image IMAGE --config-dir DIR --catalog FILE
-      --state-dir DIR --ledger-dir DIR --host-holder FILE [--home DIR]
+      --state-dir DIR --host-holder FILE [--ledger-dir LEGACY_DIR] [--home DIR]
       [--collectors FILE] [--operations FILE] [--sdk DIR]
       [--ssh-dir DIR | --known-hosts FILE] [--ssh-agent SOCKET]
       [--playbook-repo DIR ...] [--name NAME] -- COMMAND [ARGS...]
@@ -114,11 +114,11 @@ if [[ $mode == demo ]]; then
         web --lan-read-only --host 10.0.2.100 --port "$port" --allowed-clients 10.0.2.0/24)
 else
     [[ $# -gt 0 ]] || die 'integrated needs a Switchyard command after --'
-    [[ -n $config_dir && -n $catalog && -n $state_dir && -n $ledger_dir && -n $host_holder ]] || die 'integrated needs --config-dir, --catalog, --state-dir, --ledger-dir and --host-holder'
+    [[ -n $config_dir && -n $catalog && -n $state_dir && -n $host_holder ]] || die 'integrated needs --config-dir, --catalog, --state-dir and --host-holder'
     [[ $port == 8710 ]] || die '--port is demo-only; pass web --port after --'
     config_dir=$(directory "$config_dir")
     state_dir=$(directory "$state_dir")
-    ledger_dir=$(directory "$ledger_dir")
+    [[ -z $ledger_dir ]] || ledger_dir=$(directory "$ledger_dir")
     home_dir=$(directory "$home_dir")
     host_holder=$(file "$host_holder")
     [[ -x $host_holder ]] || die "host helper is not executable: $host_holder"
@@ -126,12 +126,13 @@ else
     runtime_dir="/run/user/$uid"
     [[ -S $runtime_dir/bus ]] || die "systemd user bus missing: $runtime_dir/bus"
     [[ -S $runtime_dir/systemd/private ]] || die "systemd user manager socket missing: $runtime_dir/systemd/private"
-    # These are intentional host integration, not a sandbox or a private ledger.
+    # Intentional host integration: the SQLite authority is shared through --state-dir.
     run+=(--pid=host --network=host --security-opt=label=disable
         --tmpfs "$runtime_dir:rw,nosuid,nodev,mode=1777"
         --env SWITCHYARD_CONTAINER_HOST=1 --env "SWITCHYARD_HOST_HOLDER=$host_holder"
-        --env "SWITCHYARD_LEDGER_DIR=$ledger_dir" --env "XDG_RUNTIME_DIR=$runtime_dir"
+        --env "XDG_RUNTIME_DIR=$runtime_dir"
         --env "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime_dir/bus")
+    [[ -z $ledger_dir ]] || run+=(--env "SWITCHYARD_LEDGER_DIR=$ledger_dir")
     [[ ! -v SWITCHYARD_EXTERNAL_LEASE_HOSTS ]] || run+=(--env SWITCHYARD_EXTERNAL_LEASE_HOSTS)
     args=(--catalog "$catalog" --state-dir "$state_dir")
     if [[ -n $collectors ]]; then
@@ -153,7 +154,7 @@ run+=(--passwd-entry "switchyard:x:$uid:$gid:Switchyard:$home_dir:/bin/sh"
 if [[ $mode == integrated ]]; then
     bind "$config_dir" ro
     bind "$state_dir"
-    bind "$ledger_dir"
+    [[ -z $ledger_dir || $ledger_dir == "$state_dir" ]] || bind "$ledger_dir" ro
     bind "$runtime_dir/bus" ro
     bind "$runtime_dir/systemd/private" ro
     if [[ -n $sdk ]]; then

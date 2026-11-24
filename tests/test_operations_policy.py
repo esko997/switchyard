@@ -35,7 +35,6 @@ class Fixture(unittest.TestCase):
         self.hosts = {}
         for name in ("alpha", "beta"):
             ledger = self.root / (name + ".ledger")
-            ledger.write_text("fixture baseline\n")
             self.hosts[name] = {"host_id": name, "transport": "ssh", "target": pwd.getpwuid(os.getuid()).pw_name + "@fixture.invalid",
                                 "expected_hostname": platform.node(), "ledger": str(ledger), "user_units": [], "system_units": []}
         # The descriptions an old (schema 1) policy carried inline, one per supported kind.
@@ -345,9 +344,8 @@ class ExampleTests(unittest.TestCase):
             catalog = root / "home-lab.json"
             catalog.write_text((ROOT / "catalogs/example.json").read_text())
             collectors = json.loads((ROOT / "catalogs/collectors.example.json").read_text())
-            for host in collectors["hosts"]:  # ledgers must exist; the example's paths are placeholders to edit
+            for host in collectors["hosts"]:  # replace the example label path hints
                 ledger = root / Path(host["ledger"]).name
-                ledger.write_text("example ledger\n")
                 host["ledger"] = str(ledger)
             (root / "home-lab.collectors.json").write_text(json.dumps(collectors))
             (root / "home-lab.operations.json").write_text((ROOT / "catalogs/operations.example.json").read_text())

@@ -1,11 +1,10 @@
 """Start tokens for registered (adopted) applications, against a fixture host only.
 
 The real fixed remote program (`tokens_remote.main`) runs in-process against a temporary
-$HOME while the worker holds a real flock on a fixture ledger. No real host is touched.
+$HOME while the worker holds a durable SQLite lease. No real host is touched.
 """
 import argparse
 from contextlib import redirect_stdout
-import fcntl
 import io
 import json
 import os
@@ -21,6 +20,8 @@ from unittest.mock import patch
 from switchyard import operation_worker, tokens, tokens_remote
 from switchyard.broker import Broker
 from switchyard.deploy import DeployManager
+from switchyard.leases import LedgerBroker, mark_uncertain
+from switchyard.lease_db import resource_label
 from switchyard.operation_store import encode
 from switchyard.remote import RemoteError
 
@@ -53,13 +54,14 @@ class TokenTests(unittest.TestCase):
         self.hosts = {}
         for name in ("alpha", "beta"):
             ledger = self.root / ("DEVICE_ACCESS_" + name.upper() + ".md")
-            ledger.write_text("fixture baseline\n")
             self.hosts[name] = {"host_id": name, "transport": "ssh", "target": pwd.getpwuid(os.getuid()).pw_name + "@fixture.invalid",
                                 "expected_hostname": platform.node(), "ledger": str(ledger), "user_units": [], "system_units": []}
         self.config = {"schema_version": 2, "shell_hosts": [], "workloads": {}, "token_hosts": ["alpha"]}
         self.config_path = self.root / "operations.json"
         self.write_config()
         self.broker = Broker(self.config_path, hosts=self.hosts, state_dir=self.root / "state")
+        self.leases = LedgerBroker({name: Path(host["ledger"]) for name, host in self.hosts.items()},
+                                  state_dir=self.broker.lease_state_dir)
         self.manager = tokens.TokenManager(self.broker)
         DeployManager(self.broker).register_application(bundle(), expected_revision=0)
         self.home = self.root / "home" / "user"
@@ -77,15 +79,17 @@ class TokenTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.config))
 
     def fake_remote(self, host, source, payload, *, timeout, local=False):
-        with open(host["ledger"], "a") as ledger:  # the worker holds the canonical lease for the whole step
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease = self.leases.store.current(resource_label(host["host_id"], host["ledger"]))
+        self.assertIsNotNone(lease)  # durable authority covers the whole remote step
+        self.assertEqual((lease["resource"], lease["owner"], lease["status"]), (host["host_id"], "switchyard", "claimed"))
+        self.assertFalse(Path(host["ledger"]).exists())
         self.assertIn("def main(payload)", source)
         self.remote_actions.append(payload["action"])
         return json.loads(json.dumps(tokens_remote.main(json.loads(json.dumps(payload)))))
 
     def dispatch(self, receipt, payload):
         payload = {**payload, "operation_id": receipt["id"], "state_dir": str(self.broker.store.directory),
+                   "lease_state_dir": str(self.broker.lease_state_dir),
                    "hosts": {key: self.hosts[key] for key in receipt["host_ids"]}}
         payload.pop("operation_hosts", None)
         with patch.object(operation_worker.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(encode(payload).encode()))), \
@@ -201,15 +205,11 @@ class TokenTests(unittest.TestCase):
         self.assertEqual((self.remote_actions, result["token"]), ([], None))
 
     def test_busy_lease_and_device_block(self):
-        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), open(self.hosts["alpha"]["ledger"], "a") as ledger:
-            fcntl.flock(ledger, fcntl.LOCK_EX)
+        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), \
+                self.leases.hold("alpha", owner="fixture", scope="busy token issue", worktree=str(self.root)):
             result = self.issue("issue-busy")
         self.assertEqual((result["receipt"]["status"], result["token"]), ("busy", None))
-        leases = self.root / "leases"
-        leases.mkdir()
-        block = leases / "blocked-ALPHA.json"
-        block.write_text(json.dumps({"device": "ALPHA", "operator": "op", "reason": "lease broken", "at": "now"}))
-        block.chmod(0o600)
+        self.leases.store.break_device("ALPHA", reason="lease broken", operator="op")
         result = self.issue("issue-blocked")
         self.assertEqual(result["receipt"]["status"], "busy")
         self.assertIn("blocked", result["receipt"]["error"])
@@ -245,6 +245,11 @@ class TokenTests(unittest.TestCase):
             result = self.issue("issue-lost")
         self.assertEqual(result["receipt"]["status"], "needs-inspection")
         self.assertEqual((result["token"]["state"], result["token"]["generation"], result["token"]["uncertain"]), ("unknown", 1, True))
+        lease = self.leases.store.current("ALPHA")
+        self.assertEqual(lease["status"], "suspect")
+        self.leases.store.break_device("ALPHA", reason="fixture recovery", operator="test",
+                                       attest_stopped="The in-process token write returned; no transport or worker remains",
+                                       expected_id=lease["lease_id"])
         _, verification = self.verify()
         self.assertEqual(self.codes(verification), ["token-journal-uncertain"])
         result = self.issue("issue-after-loss")
@@ -314,14 +319,20 @@ class TokenTests(unittest.TestCase):
         self.issue("issue-1")
 
         def lost(host, source, payload, *, timeout, local=False):
+            mark_uncertain("fixture verification transport lost", resource=host["host_id"])
             raise RemoteError("transport lost")
 
         with patch.object(tokens, "run_remote", side_effect=lost):
             result, verification = self.verify()
         self.assertEqual((result["hosts"][0]["receipt"]["status"], self.codes(verification), result["consistent"]),
                          ("needs-inspection", ["unreachable"], False))
-        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), open(self.hosts["alpha"]["ledger"], "a") as ledger:
-            fcntl.flock(ledger, fcntl.LOCK_EX)
+        lease = self.leases.store.current("ALPHA")
+        self.assertEqual(lease["status"], "suspect")
+        self.leases.store.break_device("ALPHA", reason="fixture recovery", operator="test",
+                                       attest_stopped="The injected read transport failed before the remote call ran",
+                                       expected_id=lease["lease_id"])
+        with patch.dict(os.environ, {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"}), \
+                self.leases.hold("alpha", owner="fixture", scope="busy token verification", worktree=str(self.root)):
             result, verification = self.verify()
         self.assertEqual((result["hosts"][0]["receipt"]["status"], self.codes(verification)), ("busy", ["unreachable"]))
 

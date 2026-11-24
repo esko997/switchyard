@@ -1,5 +1,4 @@
 """Isolated collector regressions: no test contacts a host or collects this machine."""
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from switchyard import collector, locks, probe
-from switchyard.leases import LeaseBusy
+from switchyard.leases import LedgerBroker, LeaseBusy
 
 
 def config():
@@ -68,12 +67,13 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             collector.load_config(self.path)
 
-    def test_symlink_ledger_and_missing_ledger_denied(self):
+    def test_symlink_ledger_denied_and_missing_metadata_path_allowed(self):
         link = Path(self.temp.name) / "link"
         link.symlink_to(self.ledger)
-        for ledger in (link, Path(self.temp.name) / "missing"):
-            with self.subTest(ledger=ledger), self.assertRaises(ValueError):
-                self.load({**self.remote(), "ledger": str(ledger)})
+        with self.assertRaises(ValueError):
+            self.load({**self.remote(), "ledger": str(link)})
+        record = {**self.remote(), "ledger": str(Path(self.temp.name) / "missing")}
+        self.assertEqual(self.load(record)["test-host"], record)
 
     def test_explicit_canonical_ledger_does_not_depend_on_endpoint(self):
         record = {**self.remote(), "target": "operator@192.168.50.20"}
@@ -109,9 +109,9 @@ class ConfigurationTests(unittest.TestCase):
              patch.object(adapter, "collect_host", create=True, return_value={"android": "fixture"}) as collect, \
              patch.object(collector, "_probe_source", side_effect=AssertionError("No Linux batch for ADB")):
             self.assertEqual(self.load(record), {"android": record})
-            self.assertEqual(collector.collect_host(record), {"android": "fixture"})
+            self.assertEqual(collector.collect_host(record, state_dir=self.temp.name), {"android": "fixture"})
         self.assertEqual(validate.call_count, 2)
-        collect.assert_called_once_with(record)
+        collect.assert_called_once_with(record, state_dir=self.temp.name)
 
     def test_composed_probe_is_standalone_stdlib_source(self):
         source = collector._probe_source({**config(), "container_engines": ["podman"]}).decode()
@@ -423,9 +423,13 @@ class ProcessAndLeaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.state = Path(self.temp.name) / "state"
         self.ledger = Path(self.temp.name) / "ledger"
-        self.ledger.write_text("fixture ledger\n")
         self.remote = {**config(), "transport": "ssh", "target": "observer@fixture.test", "ledger": str(self.ledger)}
+        self.broker = LedgerBroker({"test-host": self.ledger}, state_dir=self.state)
+
+    def events(self):
+        return list(reversed(self.broker.store.history()))
 
     def run_python(self, code, seconds=2):
         return collector._run([sys.executable, "-I", "-S", "-c", code], b"", time.monotonic() + seconds)
@@ -459,43 +463,70 @@ class ProcessAndLeaseTests(unittest.TestCase):
         self.assertIsNotNone(children[0].poll())
         self.assertTrue(children[0].stdout.closed)
 
-    def test_cancellation_reaps_before_lease_receipt_and_release(self):
-        events = []
-        original = collector._receipt
-        def receipt(*args):
-            events.append("receipt")
-            with self.ledger.open("a") as stream:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            original(*args)
-        with patch.object(collector, "_run", side_effect=KeyboardInterrupt), patch.object(collector, "_receipt", side_effect=receipt):
+    def test_cancellation_preserves_suspect_reservation(self):
+        with patch.object(collector, "_run", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                collector.collect_host(self.remote)
-        self.assertEqual(events, ["receipt"])
-        self.assertIn('"event": "RELEASE"', self.ledger.read_text())
-        self.assertLess(self.ledger.read_text().index('"event": "OBSERVATION"'), self.ledger.read_text().index('"event": "RELEASE"'))
+                collector.collect_host(self.remote, state_dir=self.state)
+        self.assertEqual(self.broker.store.current("TESTHOST")["status"], "suspect")
+        self.assertEqual([entry["event"] for entry in self.events()], ["CLAIM", "SUSPECT"])
 
     def test_lease_refusal_does_not_spawn(self):
-        with self.ledger.open("a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+        with self.broker.hold("test-host", owner="test", scope="busy fixture", worktree=self.temp.name):
+            before = self.events()
             with patch.object(collector, "_run", side_effect=AssertionError("No transport while busy")):
                 with self.assertRaises(LeaseBusy):
-                    collector.collect_host(self.remote)
-        self.assertNotIn('"event": "CLAIM"', self.ledger.read_text())
+                    collector.collect_host(self.remote, state_dir=self.state)
+            self.assertEqual(self.events(), before)
 
-    def test_failure_preserves_sanitization_and_receipt(self):
-        with patch.object(collector, "_run", return_value=(255, b"password and remote errors")):
+    def collect_failed_ssh(self, diagnostic):
+        original = collector.subprocess.Popen
+        def spawn(command, **kwargs):
+            self.assertEqual(command[0], "ssh")
+            code = "import sys; sys.stderr.write(" + repr(diagnostic) + "); sys.exit(255)"
+            return original([sys.executable, "-I", "-S", "-c", code], **kwargs)
+        with patch.object(collector.subprocess, "Popen", side_effect=spawn):
             with self.assertRaises(collector.CollectionError) as error:
-                collector.collect_host(self.remote)
-        self.assertNotIn("password", str(error.exception))
-        self.assertIn('"outcome": "failed"', self.ledger.read_text())
+                collector.collect_host(self.remote, state_dir=self.state)
+        return error.exception
 
-    def test_success_receipt_includes_evidence_before_release(self):
+    def test_clean_offline_failure_preserves_sanitization_and_releases(self):
+        error = self.collect_failed_ssh("ssh: connect to host fixture.test port 22: Connection refused\n")
+        self.assertNotIn("Connection refused", str(error))
+        self.assertIsNone(self.broker.store.current("TESTHOST"))
+        release = self.events()[-1]
+        self.assertEqual(release["event"], "RELEASE")
+        self.assertEqual(release["details"]["observation"], "failed")
+        self.assertNotIn("Connection refused", json.dumps(self.events()))
+
+    def test_dropped_ssh_session_cannot_be_mistaken_for_clean_offline(self):
+        error = self.collect_failed_ssh("Connection to fixture.test closed by remote host. private diagnostic\n")
+        self.assertNotIn("private diagnostic", str(error))
+        self.assertEqual(self.broker.store.current("TESTHOST")["status"], "suspect")
+        self.assertNotIn("RELEASE", [entry["event"] for entry in self.events()])
+        self.assertNotIn("private diagnostic", json.dumps(self.events()))
+
+    def test_unexpected_transport_exception_keeps_host_suspect(self):
+        with patch.object(collector, "_run", side_effect=OSError("private transport failure")):
+            with self.assertRaises(collector.CollectionError):
+                collector.collect_host(self.remote, state_dir=self.state)
+        self.assertEqual(self.broker.store.current("TESTHOST")["status"], "suspect")
+        self.assertNotIn("RELEASE", [entry["event"] for entry in self.events()])
+        self.assertNotIn("private transport failure", json.dumps(self.events()))
+
+    def test_success_receipt_in_release_includes_evidence(self):
         output = json.dumps(snapshot()).encode()
-        with patch.object(collector, "_run", return_value=(0, output)):
-            self.assertEqual(collector.collect_host(self.remote)["host_id"], "test-host")
-        self.assertIn("snapshot_sha256", self.ledger.read_text())
-        self.assertIn("2026-11-22T00:00:00+00:00", self.ledger.read_text())
+        def run(*args):
+            self.assertEqual(self.broker.store.current("TESTHOST")["status"], "claimed")
+            return 0, output
+        with patch.object(collector, "_run", side_effect=run):
+            self.assertEqual(collector.collect_host(self.remote, state_dir=self.state)["host_id"], "test-host")
+        events = self.events()
+        self.assertEqual([entry["event"] for entry in events], ["CLAIM", "RELEASE"])
+        self.assertEqual(events[0]["lease_id"], events[1]["lease_id"])
+        evidence = events[1]["details"]["observation"]
+        self.assertEqual(len(evidence["snapshot_sha256"]), 64)
+        self.assertEqual(evidence["observed_at"], "2026-11-22T00:00:00+00:00")
+        self.assertIsNone(self.broker.store.current("TESTHOST"))
 
 
 if __name__ == "__main__":

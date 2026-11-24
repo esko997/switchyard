@@ -1,5 +1,4 @@
 """Isolated Android adapter fixtures; never use the SDK, a device or host telemetry."""
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -15,7 +14,8 @@ from unittest.mock import patch
 
 from switchyard import android
 from switchyard.collector import CollectionError
-from switchyard.leases import LeaseBusy
+from switchyard.lease_db import LeaseStore
+from switchyard.leases import LedgerBroker, LeaseBusy
 
 SERIAL = "TESTUSB0001"
 SORTIE = "org.example.launcher"
@@ -55,7 +55,7 @@ class Fixture(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.ledger = self.root / "DEVICE_ACCESS_TESTHANDHELD.md"
-        self.ledger.write_text("isolated fixture ledger\n")
+        self.state = self.root / "state"
         self.mapping = patch.object(android.locks, "DEFAULT_LEDGER_DIR", self.root)
         self.mapping.start()
         self.addCleanup(self.mapping.stop)
@@ -67,10 +67,11 @@ class Fixture(unittest.TestCase):
         self.sdk.start()
         self.addCleanup(self.sdk.stop)
         self.config = config(self.ledger)
+        self.broker = LedgerBroker({"test-handheld": self.ledger}, state_dir=self.state)
 
     def collect(self, output=None):
         with patch.object(android, "_existing_server"), patch.object(android, "_run", return_value=(0, response() if output is None else output)):
-            return android.collect_host(self.config)
+            return android.collect_host(self.config, state_dir=self.state)
 
 
 class ConfigurationTests(Fixture):
@@ -265,43 +266,54 @@ class ExistingServerTests(unittest.TestCase):
 
 class LeaseAndTransportTests(Fixture):
     def events(self):
-        return [json.loads(line) for line in self.ledger.read_text().splitlines()[1:]]
+        return list(reversed(self.broker.store.history()))
 
-    def test_busy_canonical_lease_prevents_server_and_adb_calls(self):
-        with self.ledger.open("a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
+    def test_busy_durable_lease_prevents_server_and_adb_calls(self):
+        with self.broker.hold("test-handheld", owner="test", scope="busy fixture", worktree=str(self.root)):
+            before = self.events()
             with patch.object(android, "_existing_server", side_effect=AssertionError("No target access")), \
                  patch.object(android, "_run", side_effect=AssertionError("No adb")), self.assertRaises(LeaseBusy):
-                android.collect_host(self.config)
-        self.assertEqual(self.events(), [])
+                android.collect_host(self.config, state_dir=self.state)
+            self.assertEqual(self.events(), before)
 
-    def test_receipt_is_inside_lease_bound_to_claim_and_sanitized_evidence(self):
-        original = android._receipt
-        def receipt(*args):
-            with self.ledger.open("a") as stream:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            original(*args)
-        with patch.object(android, "_receipt", side_effect=receipt):
+    def test_release_receipt_is_bound_to_claim_and_sanitized_evidence(self):
+        original = LeaseStore.finish
+        def finish(store, lease_id, **kwargs):
+            self.assertEqual(store.current("TESTHANDHELD")["lease_id"], lease_id)
+            with self.assertRaises(LeaseBusy):
+                with self.broker.hold("test-handheld", owner="other", scope="exclusion check", worktree=str(self.root)):
+                    pass
+            return original(store, lease_id, **kwargs)
+        with patch.object(LeaseStore, "finish", new=finish):
             self.collect()
         events = self.events()
-        self.assertEqual([event["event"] for event in events], ["CLAIM", "OBSERVATION", "RELEASE"])
+        self.assertEqual([event["event"] for event in events], ["CLAIM", "RELEASE"])
         self.assertEqual(events[0]["lease_id"], events[1]["lease_id"])
-        self.assertEqual(events[1]["lease_id"], events[2]["lease_id"])
-        self.assertEqual(len(events[1]["outcome"]["snapshot_sha256"]), 64)
-        self.assertEqual(events[2]["outcome"], "completed")
+        self.assertEqual(len(events[1]["details"]["observation"]["snapshot_sha256"]), 64)
+        self.assertEqual(events[1]["outcome"], "completed")
+        self.assertIsNone(self.broker.store.current("TESTHANDHELD"))
 
-    def test_missing_server_transport_failure_and_cancellation_receipt_before_unlock(self):
-        for failure in (CollectionError("Existing compatible local ADB server required"), KeyboardInterrupt()):
-            with self.subTest(failure=type(failure).__name__), patch.object(android, "_existing_server", side_effect=failure), \
-                 patch.object(android, "_run", side_effect=AssertionError("No adb")), self.assertRaises(type(failure)):
-                android.collect_host(self.config)
-            self.assertEqual(self.events()[-2]["outcome"], "failed")
-            self.assertEqual(self.events()[-1]["event"], "RELEASE")
+    def test_missing_server_before_dispatch_releases_without_device_access(self):
+        with patch.object(android, "_existing_server", side_effect=CollectionError("Existing compatible local ADB server required")), \
+             patch.object(android, "_run", side_effect=AssertionError("No adb")), self.assertRaises(CollectionError):
+            android.collect_host(self.config, state_dir=self.state)
+        self.assertIsNone(self.broker.store.current("TESTHANDHELD"))
+        self.assertEqual(self.events()[-1]["event"], "RELEASE")
+        self.assertEqual(self.events()[-1]["details"]["observation"], "failed")
+
+    def test_unexpected_preflight_cancellation_keeps_suspect_reservation(self):
+        with patch.object(android, "_existing_server", side_effect=KeyboardInterrupt), \
+             patch.object(android, "_run", side_effect=AssertionError("No adb")), self.assertRaises(KeyboardInterrupt):
+            android.collect_host(self.config, state_dir=self.state)
+        self.assertEqual(self.broker.store.current("TESTHANDHELD")["status"], "suspect")
+        self.assertNotIn("RELEASE", [entry["event"] for entry in self.events()])
+
+    def test_transport_failure_is_sanitized_and_keeps_suspect_reservation(self):
         with patch.object(android, "_existing_server"), patch.object(android, "_run", return_value=(1, b"raw-private-secret")), self.assertRaises(CollectionError) as error:
-            android.collect_host(self.config)
+            android.collect_host(self.config, state_dir=self.state)
         self.assertNotIn("raw-private-secret", str(error.exception))
-        self.assertNotIn("raw-private-secret", self.ledger.read_text())
+        self.assertNotIn("raw-private-secret", json.dumps(self.events()))
+        self.assertEqual(self.broker.store.current("TESTHANDHELD")["status"], "suspect")
 
     def test_real_local_fake_command_bounds_stdout_stderr_and_deadline(self):
         for stream, limit in (("stdout", android.MAX_STDOUT), ("stderr", android.MAX_STDERR)):
@@ -332,7 +344,7 @@ class LeaseAndTransportTests(Fixture):
         self.assertTrue(children[0].stdout.closed)
         self.assertTrue(children[0].stderr.closed)
 
-    def test_real_process_group_is_cleaned_before_receipt_and_release(self):
+    def test_real_process_group_is_cleaned_before_marking_suspect(self):
         child_file = self.root / "children"
         fake = self.root / "fake-adb"
         code = ("import os,subprocess,sys,time,signal\n"
@@ -343,21 +355,20 @@ class LeaseAndTransportTests(Fixture):
                 "time.sleep(10)\n")
         fake.write_text("#!" + sys.executable + "\n" + code)
         fake.chmod(0o700)
-        original = android._receipt
-        def receipt(*args):
+        original = LeaseStore.suspect
+        def suspect(store, lease_id, cause):
             self.assertTrue(child_file.exists())
             for pid in map(int, child_file.read_text().split()):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pid, 0)
-            with self.ledger.open("a") as stream:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            original(*args)
+            self.assertEqual(store.current("TESTHANDHELD")["lease_id"], lease_id)
+            return original(store, lease_id, cause)
         with patch.object(android, "SDK_ADB", fake), patch.object(android, "_existing_server"), \
-             patch.object(android, "DEADLINE_SECONDS", 0.5), patch.object(android, "_receipt", side_effect=receipt), \
+             patch.object(android, "DEADLINE_SECONDS", 0.5), patch.object(LeaseStore, "suspect", new=suspect), \
              self.assertRaisesRegex(CollectionError, "deadline"):
-            android.collect_host(self.config)
-        self.assertEqual(self.events()[-1]["event"], "RELEASE")
+            android.collect_host(self.config, state_dir=self.state)
+        self.assertEqual(self.broker.store.current("TESTHANDHELD")["status"], "suspect")
+        self.assertNotIn("RELEASE", [entry["event"] for entry in self.events()])
 
     def test_on_device_filters_run_against_only_isolated_fake_command_fixtures(self):
         awk = shutil.which("awk")
@@ -389,12 +400,12 @@ class LeaseAndTransportTests(Fixture):
                         "os.execv('/bin/sh',['sh','-c',script])\n")
         fake.chmod(0o700)
         with patch.object(android, "SDK_ADB", fake), patch.object(android, "_existing_server"):
-            result = android.collect_host(self.config)
+            result = android.collect_host(self.config, state_dir=self.state)
         self.assertEqual([w["native_id"] for w in result["workloads"]], [SORTIE])
         self.assertEqual(len(result["artifacts"]), 3)
         self.assertEqual(result["storage"]["filesystems"][0]["available_bytes"], 400 * 1024)
         self.assertNotIn("PRIVATE_PAYLOAD", json.dumps(result))
-        self.assertNotIn("PRIVATE_PAYLOAD", self.ledger.read_text())
+        self.assertNotIn("PRIVATE_PAYLOAD", json.dumps(self.broker.store.history()))
         self.assertNotIn("unconfigured.private", json.dumps(result))
         self.assertEqual(result["workloads"][0]["extensions"]["android.v1"]["process_uids"], [10123])
 

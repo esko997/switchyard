@@ -10,6 +10,7 @@ import stat
 import uuid
 
 from .collector import _json, _validate_config
+from .leases import mark_uncertain
 from .operation_store import digest, encode, now
 from .remote import RemoteError, run_remote
 from . import fleet_keys_remote
@@ -187,7 +188,7 @@ def execute_worker(request, hosts, store, operation_id, *, local_host_ids=()):
 
 
 def _execute_worker(request, hosts, store, operation_id, *, local_host_ids=()):
-    """Called only inside the existing worker's whole-operation canonical leases."""
+    """Called only inside the worker's whole-operation device leases."""
     source = Path(fleet_keys_remote.__file__).read_text() + "\nmain(PAYLOAD)\n"
     deadline = time.monotonic() + 240
     with store.transaction() as db:
@@ -207,6 +208,7 @@ def _execute_worker(request, hosts, store, operation_id, *, local_host_ids=()):
                 raise RemoteError("Invalid key metadata response")
             return result
         except (RemoteError, OSError, ValueError):
+            mark_uncertain("fleet key operation completion unconfirmed", resource=host_id)
             unavailable.add(host_id)
             return {"ok": False, "status": "pending", "detail": "Bootstrap unavailable or interrupted; effects unproven; inspect before explicit reconciliation"}
 

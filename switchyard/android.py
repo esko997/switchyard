@@ -57,9 +57,6 @@ def validate_config(config: dict) -> dict:
     required_ledger = locks.DEFAULT_LEDGER_DIR.resolve() / f"DEVICE_ACCESS_{label}.md"
     if not isinstance(ledger, str) or ledger != str(required_ledger):
         raise ValueError("Android device requires its canonical ledger")
-    path = Path(ledger)
-    if not path.is_absolute() or path != path.resolve(strict=True) or not path.is_file():
-        raise ValueError("Android ledger must be an existing canonical regular file")
     packages = config["packages"]
     if (not isinstance(packages, list) or len(packages) > 16
             or any(not isinstance(p, str) or len(p) > 255 or not PACKAGE.fullmatch(p) for p in packages)
@@ -338,48 +335,39 @@ def _snapshot(output, config):
         raise CollectionError("Invalid Android observation response") from error
 
 
-def _receipt(config, lease, inode, outcome):
-    fd = os.open(config["ledger"], os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != inode:
-            raise CollectionError("Android ledger inode changed")
-        record = {"at": datetime.now(timezone.utc).isoformat(), "event": "OBSERVATION", "collector": "android-v1",
-                  "host_id": config["host_id"], "serial": config["serial"], "lease_id": lease["lease_id"],
-                  "scope": "read-only fixed metadata and configured user-0 package/process fields; no device changes",
-                  "outcome": outcome}
-        view = memoryview((json.dumps(record) + "\n").encode())
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("receipt append failed")
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
-def collect_host(config: dict) -> dict:
+def collect_host(config: dict, *, state_dir=None) -> dict:
     deadline = time.monotonic() + DEADLINE_SECONDS
     try:
         config = validate_config(config)
-        broker = LedgerBroker({config["host_id"]: Path(config["ledger"])})
+        broker = LedgerBroker({config["host_id"]: Path(config["ledger"])}, state_dir=state_dir)
         with broker.hold(config["host_id"], owner="switchyard", scope="passive Android metadata; configured user-0 packages only",
                          worktree=str(Path(__file__).resolve().parents[1])) as lease:
-            opened = os.stat(config["ledger"], follow_symlinks=False)
             outcome = "failed"
             try:
-                _existing_server(deadline)
-                status, output = _run(_command(config), deadline)
-                if status != 0:
-                    raise CollectionError("Android observation transport or probe failed")
-                snapshot = _snapshot(output, config)
-                encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
-                outcome = {"observed_at": snapshot["observed_at"], "coverage": snapshot["coverage"],
-                           "snapshot_sha256": hashlib.sha256(encoded).hexdigest()}
-                return snapshot
+                try:
+                    _existing_server(deadline)
+                    command = _command(config)
+                except (CollectionError, OSError, ValueError) as error:
+                    # Local preflight failed before the device could receive a command.
+                    failure = error
+                else:
+                    status, output = _run(command, deadline)
+                    if status != 0:
+                        raise CollectionError("Android observation transport or probe failed")
+                    try:
+                        snapshot = _snapshot(output, config)
+                    except CollectionError as error:
+                        failure = error
+                    else:
+                        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+                        outcome = {"observed_at": snapshot["observed_at"], "coverage": snapshot["coverage"],
+                                   "snapshot_sha256": hashlib.sha256(encoded).hexdigest()}
+                        return snapshot
             finally:
-                _receipt(config, lease, (opened.st_dev, opened.st_ino), outcome)
+                lease["release"]["observation"] = outcome
+        raise failure
     except (CollectionError, LeaseBusy):
         raise
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:

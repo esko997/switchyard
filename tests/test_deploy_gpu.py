@@ -364,6 +364,11 @@ class GPUDeployTests(DeployFixture):
         result = self.manager.switch_apply(self.manager.switch_plan("llm-a")["id"], approved=True, request_id="switch-crash")
         self.assertEqual(result["receipt"]["status"], "needs-inspection")
         self.remote_hook = None
+        lease = self.leases.store.current("ALPHA")
+        self.assertTrue(lease["suspect"])
+        self.leases.store.break_device("ALPHA", reason="fixture recovery", operator="test",
+                                       attest_stopped="The in-process fixture cannot leave a remote process",
+                                       expected_id=lease["lease_id"])
         found = {v["instance_id"]: v for v in self.manager.verify("llm-a")["verifications"]}
         interrupted = [f for f in found["llm-a"]["findings"] if f["code"] == "operation-interrupted"]
         self.assertIn(result["receipt"]["id"], interrupted[0]["detail"])

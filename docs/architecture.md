@@ -17,7 +17,7 @@ The [observation contract](observation-contract.md) keeps native resources, inst
 
 An explicitly started monitor holds one local leader lock and dispatches at most two bounded Linux collectors. Fast/storage/inventory lanes have independent cooldowns and release device leases between samples. Android is manual. HTTP/SSE reads cannot start a monitor or trigger probes.
 
-[LedgerBroker and agent leases](access.md) hold the same canonical inode across complete bounded transport lifetimes. Hostname and SSH-key verification bind access to a declared host. Other machines request gateway-held leases; local flock is not distributed fencing.
+[Fleet leases](access.md) reserve each device in a shared SQLite authority before work begins. A failed transport or crashed caller without completion proof keeps its reservation. Hostname and SSH-key verification bind work to the declared host. A lease coordinates compliant clients; it does not fence the device itself.
 
 Existing-service control uses small native adapters: `systemd_remote` for exact systemd/Quadlet services, `compose_remote` for complete local Compose projects. Fresh inspection-bound start/stop/restart preserves the native manager as owner. These adapters do not deploy or migrate.
 

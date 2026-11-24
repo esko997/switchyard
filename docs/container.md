@@ -40,7 +40,7 @@ Keep the resolved absolute paths identical to native Switchyard:
 | `--catalog FILE` | Required; existing file below the configuration directory |
 | `--collectors FILE`, `--operations FILE` | Optional existing files below that same directory |
 | `--state-dir DIR` | Read-write private state; same absolute directory used by native CLI/MCP |
-| `--ledger-dir DIR` | Read-write canonical ledger directory; same files and inodes used by every caller |
+| `--ledger-dir DIR` | Optional read-only legacy audit directory for migration detection; not used for live exclusion |
 | `--home DIR` | Canonical control-user home identity; defaults to the launcher's home, but does **not** mount the whole home |
 | `--host-holder FILE` | Installed native host lease-holder helper, executable on the host at this absolute path |
 | `--sdk DIR` | Optional read-only SDK; must contain `platform-tools/adb` |
@@ -50,7 +50,7 @@ Keep the resolved absolute paths identical to native Switchyard:
 
 Relative catalog/collector/operation filenames are interpreted below `--config-dir`. All host paths must already exist; the launcher resolves symlinks and rejects paths containing commas, colons or newlines because they cannot safely be represented in its mount syntax. Preserve the *resolved* catalog path: it namespaces databases. Do not relocate an established catalog into `/config`, move state into `/state`, or create copied ledgers for the container. Ancillary configuration files referenced by a catalog must also be inside the explicitly mounted configuration directory.
 
-State contains credentials, TLS private keys and operational history. Prepare new state directories with owner-only access (`umask 077`); do not change ownership of an existing installation to fit an image. Never run `podman unshare chown` against live state. All consumers must retain the same catalog, state, policies and `SWITCHYARD_LEDGER_DIR`. Stop old desk/monitor processes before starting replacements; do not seed an empty namespace and mistake it for a migration. Back up private state separately, outside the build context.
+State contains credentials, TLS private keys and operational history, including the authoritative lease database used by native and containerized entry points. Prepare it with owner-only access (`umask 077`); never run `podman unshare chown` against it. Use the same resolved catalog and state for all callers, and migrate before replacing a legacy authority. Back up private state outside the build context.
 
 The launcher sets:
 
@@ -58,7 +58,7 @@ The launcher sets:
 - `--pid=host --network=host`, preserving real process identity and the existing host ADB server/SSH transports;
 - `--security-opt=label=disable` in **integrated mode only**: sharing canonical files and the user bus on SELinux hosts must not relabel them. Do not add `:z`/`:Z` to shared state, ledgers, SDK or SSH mounts;
 - the existing user bus and systemd manager sockets (`/run/user/UID/bus` and `/run/user/UID/systemd/private`), `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` for transient tasks on the host's systemd user manager;
-- `SWITCHYARD_CONTAINER_HOST=1`, `SWITCHYARD_HOST_HOLDER`, and `SWITCHYARD_LEDGER_DIR`. If defined in the launcher's environment, `SWITCHYARD_EXTERNAL_LEASE_HOSTS` is forwarded unchanged (a private comma-separated list of externally coordinated host IDs).
+- `SWITCHYARD_CONTAINER_HOST=1`, `SWITCHYARD_HOST_HOLDER`, and optionally `SWITCHYARD_LEDGER_DIR`. If defined in the launcher's environment, `SWITCHYARD_EXTERNAL_LEASE_HOSTS` is forwarded unchanged (a private comma-separated list of externally coordinated host IDs).
 
 The image does not acquire a new host identity. The launcher checks the container's passwd home before executing Switchyard because OpenSSH uses passwd, not just `HOME`, for default identity, known-host and Include paths. An existing image account with the same UID but a different home fails closed. The home and runtime directories are private temporary filesystems; only explicitly selected subpaths are mounted. `/tmp` and uv's scratch cache are ephemeral too.
 
@@ -118,7 +118,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/switchyard/tools/run-container.sh integrated --image localhost/switchyard:local --config-dir /srv/switchyard/config --catalog fleet.json --collectors fleet.collectors.json --operations fleet.operations.json --state-dir /var/home/operator/.local/state/switchyard --ledger-dir /var/home/operator/.local/state/switchyard/ledgers --home /var/home/operator --host-holder /var/home/operator/.local/bin/switchyard-host-holder --ssh-dir /var/home/operator/.ssh --name switchyard-control -- container-service
+ExecStart=/opt/switchyard/tools/run-container.sh integrated --image localhost/switchyard:local --config-dir /srv/switchyard/config --catalog fleet.json --collectors fleet.collectors.json --operations fleet.operations.json --state-dir /var/home/operator/.local/state/switchyard --home /var/home/operator --host-holder /var/home/operator/.local/bin/switchyard-host-holder --ssh-dir /var/home/operator/.ssh --name switchyard-control -- container-service
 ExecStop=/usr/bin/podman --remote=false stop --ignore --time 50 switchyard-control
 Restart=on-failure
 RestartSec=5
@@ -130,7 +130,7 @@ WantedBy=default.target
 
 The launcher gives Podman a 50-second stop grace; retain a longer systemd stop timeout (65 seconds above) so graceful host-job cancellation can finish. Do not add a TTY or background the launcher. For separate desks/monitor, use separate service names and Podman `--name` values; do not also run a second monitor inside `container-service`. Keep public/authenticated listener choices explicit rather than reviving a retired read-only LAN service. Login/linger semantics remain those of the existing systemd user manager; enabling linger is an operator choice, not part of the image.
 
-Retain the existing LAN DNS timer. Its oneshot service may run the same launcher with the same mounts/global options and suffix `-- lan-dns-sync`; use a distinct container name or omit `--name`. An equivalent native public CLI invocation with those same canonical configuration/state/ledger paths is also supported. A short-lived instance of the same image needs no additional daemon. Preserve the existing timer cadence and `TimeoutStartSec`; the launcher itself never schedules recurring work.
+Retain the existing LAN DNS timer. Its oneshot service may run the same launcher with `-- lan-dns-sync`; use a distinct container name or omit `--name`. An equivalent native CLI invocation with the same configuration and state paths is also supported. Preserve the timer cadence and `TimeoutStartSec`; the launcher does not schedule work.
 
 For a new installation only, a conventional timer is:
 
@@ -152,6 +152,6 @@ Its service is `Type=oneshot`, has `TimeoutStartSec=7min`, and uses the full int
 
 ## Boundaries and rollback
 
-The launcher never edits host configuration, creates ledgers, copies private homes, publishes a registry image, starts the host ADB server, or installs/enables units. A read-only image does not make the mounted state or user bus read-only. Processes sharing the control user's UID and canonical ledgers remain trusted participants; leases coordinate access, not hostile-code containment.
+The launcher never edits host configuration, creates ledgers, copies private homes, publishes a registry image, starts the host ADB server, or installs/enables units. A read-only image does not make the mounted state or user bus read-only. Processes sharing the control user's UID remain trusted participants; leases coordinate access, not hostile-code containment.
 
-For migration, stop the old control-plane processes, snapshot private state/configuration securely, and replace only the explicitly selected service commands. Verify the catalog namespace, state, ledger inode sharing, host identity/lease attribution, SSH trust, ADB transport, listeners/authentication, and DNS timer before calling it complete. Do not run native and container desks on the same ports simultaneously. For rollback, stop the container services and restore the former native unit commands with the same paths; do not restore an old live database over newer operation receipts without reconciling their outcomes. The container image is replaceable; the private state, TLS identities and canonical ledgers are not.
+For migration, stop the old control-plane processes, back up private state and configuration securely, and replace only the selected service commands. Verify the catalog namespace, shared SQLite authority, host identity/lease attribution, SSH trust, ADB transport, listeners/authentication and DNS timer. A native rollback must use the same database and compatible code; never reopen an old backend or restore a stale lease database without reconciling newer work. See [the lease cutover](access.md#migrating-an-existing-authority).

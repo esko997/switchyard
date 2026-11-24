@@ -193,7 +193,7 @@ def inspect(broker, workload_id, request_id):
 
 
 def _request(broker, config, workload_id, workload, fingerprint, action):
-    # A collector-local host runs the same fixed adapter in a local child under its canonical ledger.
+    # A collector-local host runs the same fixed adapter locally under its device reservation.
     return {"action": action, "workload_id": workload_id, "config": workload,
             "authority_fingerprint": fingerprint, "config_path": str(broker.config_path.resolve()),
             "local": workload["host_id"] in broker.local_host_ids(config)}

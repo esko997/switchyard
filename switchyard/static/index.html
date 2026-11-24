@@ -329,8 +329,8 @@
         <p id="agents-status" class="status-line" role="status"></p>
         <p id="agents-error" class="error-message" role="alert" hidden></p>
         <div class="section-heading minor"><h3>Device locks</h3><span id="locks-count" class="count"></span></div>
-        <p class="section-note">The kernel lock is authoritative; ledger entries are supporting records. “Process started” is when the holder began, which can be earlier than when it took the lock.</p>
-        <div class="lock-head" aria-hidden="true"><span>Device</span><span>Host</span><span>State</span><span>Last ledger entry</span></div>
+        <p class="section-note">Switchyard reserves devices until completion is confirmed. A lost connection or missed deadline keeps the device reserved until recovery.</p>
+        <div class="lock-head" aria-hidden="true"><span>Device</span><span>Host</span><span>State</span><span>Last lease event</span></div>
         <div id="device-locks" class="lock-list"><p class="empty-state">Loading lock state.</p></div>
         <div class="section-heading minor"><h3>Agents by host</h3></div>
         <div id="agents-list"><p class="empty-state">Loading agents.</p></div>

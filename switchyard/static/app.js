@@ -898,7 +898,7 @@
     return link;
   }
   function holderLabel(holder) {
-    return text(holder.paseo_agent_name, `${text(holder.comm, "unknown process")} (pid ${holder.pid ?? "unknown"})`);
+    return text(holder.paseo_agent_name, text(holder.owner, `${text(holder.comm, "unknown process")} (pid ${holder.pid ?? "unknown"})`));
   }
   function locksForHost(host) {
     return array(agentsData?.locks).filter((lock) => (lock.state === "held" || lock.anomaly) && strings(lock.host_ids).includes(host.id));
@@ -907,10 +907,6 @@
     return array(agentsData?.locks).filter((lock) => lock.state === "held"
       && array(lock.holders).some((holder) => holder.paseo_agent_id === agentId)).map((lock) => text(lock.device));
   }
-  const LOCK_ANOMALIES = {
-    "held-after-release": "Still held after the ledger recorded a release. The holding process owns the kernel lock.",
-    "claim-without-holder": "The ledger shows a claim but nothing holds the lock. The process may have exited without recording a release.",
-  };
   function lockRow(lock) {
     const holders = array(lock.holders);
     const entries = array(lock.last_entries);
@@ -922,24 +918,24 @@
       state.append(group("span", "authority is-granted", flag(), `Held by ${holders.map(holderLabel).join(", ") || "an unknown holder"}`));
       const started = holders.map((item) => item.started_at).filter(Boolean)[0];
       if (started) state.append(node("span", `Process started ${ageLabel(ageSeconds(started))}`, "row-sub"));
-      if (lease) state.append(node("span", lease.expires_at ? `Lease expires ${clock(lease.expires_at)}` : "Lease ends when its command completes", "row-sub"));
-      if (lease?.suspect) state.append(node("span", `Connection lost ${ageLabel(ageSeconds(lease.suspect_since))} (${text(lease.suspect_cause, "unknown cause")}); the remote command may still be running. Held on purpose until released.`, "row-attention"));
+      if (lease) state.append(node("span", lease.expires_at ? `Lease deadline ${clock(lease.expires_at)}` : "Lease ends when its command completes", "row-sub"));
+      if (lease?.suspect) state.append(node("span", `Completion unconfirmed ${ageLabel(ageSeconds(lease.suspect_since))} (${text(lease.suspect_cause, "unknown cause")}). Device remains reserved.`, "row-attention"));
     } else if (lock.state === "free") state.append(node("span", lock.blocked ? "Free, but blocked" : "Free", "authority"));
     else state.append(group("span", "cell-state", lamp("dark"), sentence(text(lock.state, "unknown"))));
     if (lock.blocked) state.append(node("span", lock.blocked.error ? `Blocked: ${text(lock.blocked.error)}`
       : `Blocked since a lease was broken ${ageLabel(ageSeconds(lock.blocked.at))} by ${text(lock.blocked.operator, "the operator")} (${text(lock.blocked.reason, "no reason given")}). New leases are refused until: switchyard lease clear ${text(lock.device).toLocaleLowerCase()} --attest-stopped "…"`, "row-attention"));
     const summary = group("span", "lock-summary", node("strong", text(lock.device), "lock-device"), node("span", hostNames, "lock-hosts"), state,
-      node("span", latest ? `${{ CLAIM: "Claimed", RELEASE: "Released" }[latest.event] || sentence(text(latest.event).toLocaleLowerCase())} ${ageLabel(ageSeconds(latest.at))} by ${text(latest.owner, "an unnamed owner")}` : "No ledger entries", "lock-ledger"),
-      lock.anomaly && node("span", LOCK_ANOMALIES[lock.anomaly] || text(lock.anomaly), "row-attention"));
+      node("span", latest ? `${{ CLAIM: "Claimed", RELEASE: "Released" }[latest.event] || sentence(text(latest.event).toLocaleLowerCase())} ${ageLabel(ageSeconds(latest.at))} by ${text(latest.owner, "an unnamed owner")}` : "No lease events", "lock-ledger"),
+      lock.anomaly && node("span", text(lock.anomaly), "row-attention"));
     const body = node("div", undefined, "record-body");
-    body.append(metadata([["Ledger", text(lock.path)],
+    body.append(metadata([["Device label", text(lock.device)],
       ...(lease ? [["Switchyard lease", text(lease.lease_id)], ["Owner", text(lease.owner)], ["Scope", text(lease.scope)],
-        ["Expires", lease.expires_at ? timestamp(lease.expires_at) : "When its command completes"],
+        ["Deadline", lease.expires_at ? timestamp(lease.expires_at) : "When its command completes"],
         ["Holder unit", text(lease.holder_unit, "Foreground command")]] : []),
       ...holders.map((item) => [holderLabel(item), `${text(item.cmdline)}\n${text(item.cwd)}\nStarted ${timestamp(item.started_at)}`])]),
-    node("h4", "Recent ledger entries"),
+    node("h4", "Recent lease events"),
     entries.length ? table(["Event", "When", "Owner", "Scope"], entries.slice().reverse().map((entry) => [text(entry.event), timestamp(entry.at), text(entry.owner), text(entry.scope, "")]))
-      : empty("No ledger entries available."));
+      : empty("No lease events available."));
     const details = disclosure(`lock:${lock.device}`, summary, body, "row-details lock-row");
     details.id = `lock-${lock.device}`;
     return details;

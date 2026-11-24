@@ -2,27 +2,24 @@
 
 ## Boundary
 
-Switchyard coordinates access through append-only `DEVICE_ACCESS_*.md` ledgers on one control host. A lease is coordination, not operation approval, device state or runtime fencing.
+Switchyard coordinates device access through one private SQLite lease database
+on the control host (`<state-dir>/leases/leases.sqlite3`). Granting a device
+reserves it and records the claim in a short transaction. No transaction or
+file lock stays open for the duration of the work. A lease is coordination,
+not operation approval or device-side fencing.
 
-`LedgerBroker` requires an operator-supplied mapping to existing canonical absolute paths. It rejects symlink aliases, takes an exclusive flock, reads the baseline under that lock, appends CLAIM/RELEASE records in place, flushes them and holds the descriptor for the complete operation. It never replaces a ledger. Process death releases the kernel lock; a missing RELEASE remains crash evidence.
-
-The default ledger root is:
-
-```sh
-${XDG_STATE_HOME:-$HOME/.local/state}/switchyard/ledgers
-```
-
-`SWITCHYARD_LEDGER_DIR` overrides it. A registry host's default filename is `DEVICE_ACCESS_<LABEL>.md` (uppercase host ID, non-alphanumeric characters removed). `host-add` creates missing ledgers; lease acquisition never creates one. Linux collectors may name an explicit existing canonical ledger. Android requires the exact default filename under this root. Keep ledgers outside checkouts and configure every writer to use the same inode.
+Existing collector `ledger` fields identify historical resource labels.
+Registry aliases for the same label share the same reservation. They no longer
+require a file to exist or grant access through an open descriptor.
 
 ## Required gateway contract
 
-1. Resolve a registry host ID to trusted connection data and canonical ledger; callers cannot supply arbitrary paths or targets.
-2. Verify authority and approval separately. Read-only device inspection also requires a lease.
-3. Acquire all required resources in deterministic order, with bounded contention; release earlier acquisitions if one is busy. Do not hold leases while building artifacts.
-4. Read the locked baseline and append the owner, scope and operation identity before device access.
-5. Keep the descriptor open through transport teardown. Never detach device work that outlives the lease.
-6. Record observed outcomes and recovery caveats. Unknown outcomes require inspection, not blind retry.
-7. Append RELEASE and unlock in a finally path. Never replace, rename or atomically rewrite a ledger.
+1. Resolve requests to trusted registry resource identities and connection data.
+2. Verify approval separately. Read-only device access still takes a lease.
+3. Acquire required resources in a consistent order. If any acquisition fails, no dispatch occurs; release previously acquired grants.
+4. Commit the claim before dispatching work. Never hold a device lease during builds.
+5. Only release the matching lease ID once the command has confirmed completion.
+6. If transport or process death leaves completion unknown, keep the reservation. Do not retry.
 
 Context completion is not an application health check. The observation monitor runs fixed bounded batches, closes transport before releasing, releases between samples, and skips contention rather than accumulating work.
 
@@ -37,21 +34,47 @@ switchyard lease status host-a
 switchyard lease list --json
 ```
 
-`run` owns the lock for the command and exports connection metadata. `hold` uses a systemd user holder across tool calls. The default TTL is 60 minutes, maximum 120; release immediately when finished. Local owner exit also ends ordinary holds. Busy exits 75 and names the holder; `--wait` is bounded to 600 seconds. MCP offers `lease_hold`, `lease_renew` and `lease_release`. Remote connection loss can leave a lease **suspect**, because the command's state is unknown; see [remote agents](remote-agents.md).
+`run` keeps working directory and stdio on the caller and exports connection
+metadata. Ordinary child exits (including a confirmed failure) release.
+Disconnects, signals, lost process identity, and deadlines without completion
+make a lease **suspect**, not free. Hold TTL defaults to 60 minutes and is
+capped at 120; crossing it does not prove the user stopped touching the device.
+Busy exits 75, including blocked and suspect devices. `--wait` is bounded to
+600 seconds. The CLI, MCP, and keyed HTTPS lease entry points share the store.
 
-A kernel flock cannot be stolen. Human-only `lease break` runs on the control host, enumerates inherited descriptor holders, revokes Switchyard leases, and signals foreign holders only when explicitly requested. It must prove the lock gone before recording BREAK. Unless the operator attests the old operation stopped, the device stays blocked until `lease clear --attest-stopped ...`. Agents must defer, never bypass a suspect or blocked device. Raw-flock callers cannot enforce Switchyard's administrative block; migrate all callers to the gateway before relying on it.
+Operator-only `lease break` can quarantine an unresolved grant. Use
+`lease clear --attest-stopped ...` only after checking that the previous work
+really ended. No API can infer a remote command stopped just because the
+coordinator or SSH process disappeared. There is no raw-file fallback.
 
 ## Android and additional gates
 
 Configure the immutable USB serial, exact user/profile and package scope yourself; no real-device allowlist is bundled. SDK lookup is `ANDROID_HOME`, then `ANDROID_SDK_ROOT`, then `~/Android/Sdk`, using only `platform-tools/adb` beneath that root. Commands select the exact serial and disconnect stdin in scripts. Collection uses an already-running local ADB server and registered transport; it never starts/restarts the server, discovers/connects wireless devices, installs packages or sends UI input.
 
-Device-specific maintenance/relay gates must be integrated before enabling a device; a plain ledger is not a substitute. Keep host build locks separate from device coordination. Never infer freedom from a static RELEASED header or an old timestamp; the current kernel lock and gateway owner govern access.
+Device-specific maintenance/relay gates must still coordinate with their own
+runtime. Keep independent host build locks separate. A stale backup is not
+authority: it cannot prove that newer work stopped.
 
-## Cross-host coordination
+## Migrating an existing authority
 
-A flock on one machine does not exclude a script on another. Route all device access through a designated gateway holding the canonical inode. Fleet SSH authentication does not make exclusion distributed. Every additional device reached by a shell script must be declared so its lease is held too; arbitrary shell cannot infer or enforce nested destinations.
+1. Replace direct file consumers and upgrade installed SSH clients before they
+   can acquire a SQLite-backed lease. Older clients may assert completion
+   after a lost command; do not mix versions on the same devices.
+2. Stop and fence all old writers (CLI/MCP ingress, desks, monitor, scheduled
+   work). Confirm that no legacy holder remains. Do not copy ledgers and run a
+   second authority.
+3. Back up the private state and the legacy ledgers. With the same original
+   `SWITCHYARD_LEDGER_DIR` and `--state-dir`, run `switchyard lease migrate --dry-run`.
+   Review the unresolved and blocked devices; neither is silently cleared.
+   Include a `--legacy-ledger LABEL=/absolute/path` for each explicitly
+   configured ledger outside the legacy directory. Use the same list on apply.
+4. From the operator terminal run `switchyard lease migrate --confirm-drained`.
+   The import preserves history and unresolved leases; it does not modify
+   legacy files. Start only the new authority and verify the lease list first.
 
-Before decentralizing, migrate all writers, timers, bridges and relays to the same protocol. Expiring distributed locks alone cannot stop a disconnected actor. Mutation needs fencing at the execution gateway or device, durable receipts and uncertain-outcome recovery.
+Do not reopen an old backend as rollback after new grants. On restore or
+failback, fence all writers and reconcile all work newer than the snapshot
+before enabling grants. An expired deadline is not a completion receipt.
 
 ## Opt-in operation broker
 

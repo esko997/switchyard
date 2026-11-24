@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from switchyard import ansible_discovery, ansible_ops
 from switchyard.ansible_ops import JOBS, SUDO_REFUSED, SUPPLIED
+from switchyard.leases import LedgerBroker
 from tests.test_ansible_ops import APPLY_EVENTS, CHECK_EVENTS, AnsibleFixture, finished, git, result
 from tests.test_interfaces import operator_headers, write_catalog
 
@@ -308,18 +309,16 @@ class RunLifecycleTests(DeskFixture):
         self.assertEqual(done["status"], "planned")
         self.assertEqual(done["plan"]["check"]["changed_tasks"], ["Install packages"])
         self.assertEqual(done["plan"]["run_id"], run["id"])
-        self.assert_ledger_free()
+        self.assert_lease_free()
 
     def test_busy_lease_names_the_holder_and_runs_nothing(self):
-        fd = os.open(self.ledger, os.O_RDONLY)
-        self.addCleanup(os.close, fd)
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        ops = self.ops()
-        run = self.wait_run(ops, ops.plan("host-init", "host-a", wait=0, background=True)["id"])
+        with LedgerBroker({"host-a": self.ledger}, state_dir=self.state).hold(
+                "host-a", owner="fixture operator", scope="test contention", worktree=str(self.root)):
+            ops = self.ops()
+            run = self.wait_run(ops, ops.plan("host-init", "host-a", wait=0, background=True)["id"])
         self.assertEqual(run["status"], "busy")
-        self.assertIn("HOSTA busy", run["error"])
-        self.assertIn(str(os.getpid()), run["error"])
+        self.assertIn("HOSTA", run["error"])
+        self.assertIn("fixture operator", run["error"])
         self.assertEqual(self.runs(), [])
 
     def test_failed_apply_and_host_lost_mid_run(self):
@@ -337,7 +336,7 @@ class RunLifecycleTests(DeskFixture):
         self.assertEqual(run["status"], "needs-inspection")
         self.assertIn("unreachable mid-run", run["error"])
         self.assertEqual([item["status"] for item in ops.receipts()], ["needs-inspection", "failed"])
-        self.assert_ledger_free()
+        self.assert_lease_suspect()
 
     def test_stopped_desk_and_dead_process_leave_needs_inspection(self):
         self.behave(check={"events": CHECK_EVENTS}, apply={"events": [
@@ -351,7 +350,7 @@ class RunLifecycleTests(DeskFixture):
         self.assertLess(time.monotonic() - started, 15)
         stopped = ops.run(run["id"])
         self.assertEqual((stopped["status"], stopped["receipt"]["status"]), ("needs-inspection", "needs-inspection"))
-        self.assert_ledger_free()
+        self.assert_lease_suspect()
         # A run whose process vanished (desk killed without cleanup) is settled on the next read.
         with sqlite3.connect(ops.store.path) as db:
             db.execute("UPDATE runs SET data=json_set(data,'$.status','running'), birth='gone' WHERE id=?", (run["id"],))
@@ -413,17 +412,17 @@ class BecomePasswordTests(DeskFixture):
         self.assertEqual([item["stdin_sha256"] for item in runner_runs], [digest, digest])
         for item in runner_runs:
             self.assertEqual(item["argv"][item["argv"].index("--become-password-file") + 1], "-")
-        # Every database and state file, the ledger, the runner log, run scratch, every event and log line.
+        # Every database and state file, runner log, run scratch, event and log line.
         haystacks = [path.read_bytes() for root in (self.state, self.root / "cache") for path in root.rglob("*")
                      if path.is_file()]
-        haystacks += [self.ledger.read_bytes(), (self.fake / "runs.jsonl").read_bytes(),
+        haystacks += [(self.fake / "runs.jsonl").read_bytes(),
                       json.dumps([ops.runs(), ops.plans(), ops.receipts(), ops.playbooks()]).encode(),
                       logs.getvalue().encode(), captured_out.getvalue().encode(), captured_err.getvalue().encode()]
         self.assertTrue(any(b"supplied by the operator" in item for item in haystacks))
         for item in haystacks:
             self.assertNotIn(PASSWORD.encode(), item)
         self.assertEqual(list((self.root / "cache/runs").iterdir()), [])
-        self.assert_ledger_free()
+        self.assert_lease_free()
 
     def test_wrong_password_is_reported_once_and_not_retried(self):
         self.behave(check={"refuse_password": "the right one", "events": CHECK_EVENTS}, apply={"events": APPLY_EVENTS})

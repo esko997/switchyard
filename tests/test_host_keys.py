@@ -1,6 +1,5 @@
 """Isolated SSH identity/lease regressions; never contacts an endpoint."""
 import base64
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -11,6 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from switchyard import collector, host_keys
+from switchyard.lease_db import LeaseStore
+from switchyard.leases import LedgerBroker, LeaseBusy
 
 
 def public_key():
@@ -23,8 +24,8 @@ class HostKeysTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        self.state = self.root / "state"
         self.ledger = self.root / "ledger"
-        self.ledger.touch()
         self.config = {"host_id": "fixture", "transport": "ssh", "target": "observer@fixture.test",
                        "ledger": str(self.ledger), "expected_hostname": "fixture",
                        "user_units": [], "system_units": []}
@@ -60,7 +61,7 @@ class HostKeysTests(unittest.TestCase):
                "target": "operator@new.test", "port": 2222}
         self.assertEqual(collector._validate_config(cfg), cfg)
         with patch.object(collector, "_run", return_value=(0, ("fixture " + public_key()).encode())) as run:
-            collector.scan_host_key(cfg, address="new.test", port=2222)
+            collector.scan_host_key(cfg, address="new.test", port=2222, state_dir=self.state)
             args, source, _ = run.call_args.args
             self.assertEqual(args[0], "ssh-keyscan")
             self.assertEqual(source, b"")
@@ -89,7 +90,7 @@ class HostKeysTests(unittest.TestCase):
         with patch.object(host_keys.os, "replace", side_effect=OSError("fixture failure")), self.assertRaises(OSError):
             host_keys.write_pins(path, {})
         self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["ledger", "pins"])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pins"])
         host_keys.write_pins(path, {})
         self.assertEqual(path.read_bytes(), b"")
         with patch.object(host_keys.os, "getuid", return_value=os.getuid() + 1), self.assertRaisesRegex(ValueError, "owned"):
@@ -102,26 +103,46 @@ class HostKeysTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             host_keys.write_pins(path, {})
 
-    def test_scan_holds_canonical_lease_through_output_and_releases(self):
+    def test_scan_holds_durable_lease_through_output_and_releases(self):
+        broker = LedgerBroker({"fixture": self.ledger}, state_dir=self.state)
         def run(command, source, deadline):
             self.assertEqual(command, ["ssh-keyscan", "-T", "5", "-p", "22", "-t", "ed25519,ecdsa,rsa", "fixture.test"])
-            with self.ledger.open("a") as stream:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertIn('"event": "CLAIM"', self.ledger.read_text())
-            self.assertNotIn('"event": "RELEASE"', self.ledger.read_text())
+            self.assertEqual(broker.store.current("FIXTURE")["status"], "claimed")
+            with self.assertRaises(LeaseBusy):
+                with broker.hold("fixture", owner="other", scope="exclusion check", worktree=str(self.root)):
+                    pass
+            self.assertEqual([entry["event"] for entry in broker.store.history()], ["CLAIM"])
             return 0, ("fixture.test " + public_key()).encode()
         with patch.object(collector, "_run", side_effect=run):
-            result = collector.scan_host_key(self.config, address="fixture.test", port=22)
+            result = collector.scan_host_key(self.config, address="fixture.test", port=22, state_dir=self.state)
         self.assertEqual(result, {"keys": [public_key()], "fingerprints": [host_keys.fingerprint(public_key())]})
-        self.assertIn('"event": "RELEASE"', self.ledger.read_text())
-        with self.ledger.open("a") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertIsNone(LeaseStore(self.state / "leases").current("FIXTURE"))
+        self.assertEqual([entry["event"] for entry in broker.store.history()], ["RELEASE", "CLAIM"])
+
+    def test_unexpected_scan_interruptions_keep_durable_reservation_suspect(self):
+        for index, failure in enumerate((KeyboardInterrupt(), OSError("private scan diagnostic"))):
+            state = self.state / str(index)
+            expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else collector.CollectionError
+            with self.subTest(failure=type(failure).__name__), \
+                 patch.object(collector, "_run", side_effect=failure), self.assertRaises(expected):
+                collector.scan_host_key(self.config, address="fixture.test", port=22, state_dir=state)
+            store = LeaseStore(state / "leases")
+            self.assertEqual(store.current("FIXTURE")["status"], "suspect")
+            self.assertNotIn("RELEASE", [entry["event"] for entry in store.history()])
+            self.assertNotIn("private scan diagnostic", str(store.history()))
+
+    def test_completed_scan_without_usable_key_releases_reservation(self):
+        with patch.object(collector, "_run", return_value=(0, b"not a usable identity")), \
+             self.assertRaisesRegex(collector.CollectionError, "no usable identity"):
+            collector.scan_host_key(self.config, address="fixture.test", port=22, state_dir=self.state)
+        store = LeaseStore(self.state / "leases")
+        self.assertIsNone(store.current("FIXTURE"))
+        self.assertEqual([entry["event"] for entry in store.history()], ["RELEASE", "CLAIM"])
 
     def test_scan_refuses_nonssh_and_different_target_without_execution(self):
         with patch.object(collector, "_run", side_effect=AssertionError("No transport")):
             for cfg in ({"transport": "local"}, {"transport": "adb"}):
                 with patch.object(collector, "_validate_config", return_value=cfg), self.assertRaises(collector.CollectionError):
-                    collector.scan_host_key(cfg, address="fixture.test", port=22)
+                    collector.scan_host_key(cfg, address="fixture.test", port=22, state_dir=self.state)
             with self.assertRaises(collector.CollectionError):
-                collector.scan_host_key(self.config, address="other.test", port=22)
+                collector.scan_host_key(self.config, address="other.test", port=22, state_dir=self.state)

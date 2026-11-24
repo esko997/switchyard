@@ -1,4 +1,4 @@
-"""Remote client (tools/switchyard-remote) against a fake `ssh` on PATH; temporary ledgers only."""
+"""Current remote SSH lease protocol against an isolated fake control host."""
 from contextlib import redirect_stderr, redirect_stdout
 import getpass
 import shlex
@@ -18,8 +18,8 @@ from unittest.mock import patch
 
 CLIENT = Path(__file__).resolve().parents[1] / "tools/switchyard-remote"
 
-# The fake ssh: records its argv, then plays the control host. Mode `real` runs the real CLI
-# (`switchyard lease attach`) on temporary ledgers; the others script one control-host behaviour.
+# The fake SSH records its argv, then plays the control host. `real` runs the
+# actual attach implementation against an isolated database, never a device.
 FAKE_SSH = r'''
 import json, os, shlex, sys, time
 with open(os.environ["FAKE_SSH_LOG"], "a") as log:
@@ -110,7 +110,6 @@ class RemoteClientTests(unittest.TestCase):
         ssh.chmod(0o755)
         (self.root / "ledgers").mkdir()
         self.ledger = self.root / "ledgers/DEVICE_ACCESS_TESTHANDHELD.md"
-        self.ledger.write_text("baseline\n")
         self.log = self.root / "ssh.log"
         self.config = self.root / "remote.json"
         self.config.write_text(json.dumps({"control": "tester@control.invalid", "switchyard": "/opt/sy/switchyard",
@@ -133,7 +132,8 @@ class RemoteClientTests(unittest.TestCase):
         return shlex.split(self.calls()[index][-1])
 
     def events(self):
-        return [json.loads(line) for line in self.ledger.read_text().splitlines() if line.startswith("{")]
+        from switchyard.lease_db import LeaseStore
+        return list(reversed(LeaseStore(self.root / "state" / "leases").history()))
 
     def spawn(self, *argv, **kwargs):
         return subprocess.Popen([sys.executable, str(CLIENT), *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -164,6 +164,7 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(remote[:4], ["/opt/sy/switchyard", "lease", "attach", "test-handheld"])
         for flag, value in (("--scope", "remote smoke"), ("--origin-host", "host-b"), ("--agent-id", "test-agent-b-0001"), ("--wait", "5")):
             self.assertEqual(remote[remote.index(flag) + 1], value)
+        self.assertIn("--completion-proof", remote)
 
     def test_claim_env_is_filtered_to_the_lease_variables(self):
         os.environ["FAKE_SSH_MODE"] = "extra"
@@ -186,17 +187,15 @@ class RemoteClientTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_busy_real_server_and_unreachable_control_host(self):
-        script = "import fcntl,sys; f=open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()"
-        holder = subprocess.Popen([sys.executable, "-c", script, str(self.ledger)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(holder.stdout.readline().strip(), "locked")
-            child = self.spawn("lease", "run", "test-handheld", "--scope", "s", "--", "true")
-            _, stderr = child.communicate(timeout=20)
-            self.assertEqual(child.returncode, 75, stderr)
-            self.assertIn("TESTHANDHELD busy", stderr)
-        finally:
-            holder.communicate(input="", timeout=5)
-        self.assertEqual(self.events(), [])
+        from switchyard.agent_leases import AgentLeases
+        manager = AgentLeases(hosts=("test-handheld",), state_dir=self.root / "state",
+                              ledger_dir=self.root / "ledgers")
+        existing = manager.hold("test-handheld", scope="existing fixture", detached=True)
+        child = self.spawn("lease", "run", "test-handheld", "--scope", "s", "--", "true")
+        _, stderr = child.communicate(timeout=20)
+        self.assertEqual(child.returncode, 75, stderr)
+        self.assertIn("TESTHANDHELD busy", stderr)
+        manager.release(existing["lease_id"])
         os.environ["FAKE_SSH_MODE"] = "unreachable"
         child = self.spawn("lease", "run", "test-handheld", "--scope", "s", "--", "true")
         _, stderr = child.communicate(timeout=20)
@@ -221,13 +220,10 @@ class RemoteClientTests(unittest.TestCase):
                 self.assertTrue(terminated.exists())
                 self.assertIn("LEASE LOST on TESTHANDHELD", stderr.getvalue())
                 releases = [call for call in self.calls() if call[-1].endswith("lease release " + "f" * 32)]
+                self.assertEqual(releases, [])
                 if mode == "die":
-                    # Lost connection: command reaped first, then an explicit release over a new connection.
-                    self.assertEqual(len(releases), 1)
-                    self.assertIn("ConnectTimeout=10", releases[0])
-                    self.assertIn("released explicitly", stderr.getvalue())
-                else:
-                    self.assertEqual(releases, [])  # The control host already ended the lease.
+                    self.assertIn("leaving", stderr.getvalue())
+                    self.assertIn("reserved", stderr.getvalue())
                 self.log.unlink()
 
     def test_lost_lease_kills_a_command_that_ignores_sigterm(self):
@@ -255,15 +251,13 @@ class RemoteClientTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(process_running(pid))
 
-    def test_unreachable_after_loss_leaves_the_lease_suspect_after_bounded_attempts(self):
+    def test_unreachable_after_loss_never_sends_a_second_completion_command(self):
         os.environ.update(FAKE_SSH_MODE="die", FAKE_SSH_EXIT="255")
-        self.client.RELEASE_RETRY_WINDOW, self.client.RELEASE_RETRY_PAUSE = 1.0, 0.2
         with redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(self.client.main(["lease", "run", "test-handheld", "--scope", "s", "--", "sleep", "30"]), 76)
-        attempts = [call for call in self.calls() if call[-1].endswith("lease release " + "f" * 32)]
-        self.assertGreaterEqual(len(attempts), 2)
-        self.assertLessEqual(len(attempts), 6)
-        self.assertIn("left SUSPECT", stderr.getvalue())
+        attempts = [call for call in self.calls() if "lease release " in call[-1]]
+        self.assertEqual(attempts, [])
+        self.assertIn("reserved", stderr.getvalue())
 
     def test_heartbeats_then_done_only_after_the_command_is_reaped(self):
         os.environ.update(FAKE_SSH_MODE="record", FAKE_DONE_LOG=str(self.root / "done.log"),
@@ -276,6 +270,17 @@ class RemoteClientTests(unittest.TestCase):
         self.assertGreaterEqual(sum(entry["line"] == "" for entry in entries), 3)
         self.assertEqual(entries[-1], {"line": "done", "command_reaped": True})
         self.assertEqual(self.remote()[self.remote().index("--heartbeat") + 1], "60")
+
+    def test_ssh_exit_255_never_sends_done_or_alias_release(self):
+        os.environ.update(FAKE_SSH_MODE="record", FAKE_DONE_LOG=str(self.root / "done.log"),
+                          FAKE_PID_FILE=str(self.root / "pid"))
+        source = "import os,sys; open(sys.argv[1],'w').write(str(os.getpid())); sys.exit(255)"
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.client.main(["lease", "run", "test-handheld", "--scope", "s", "--",
+                                               sys.executable, "-c", source, os.environ["FAKE_PID_FILE"]]), 255)
+        entries = [json.loads(line) for line in (self.root / "done.log").read_text().splitlines()]
+        self.assertFalse(any(entry["line"] == "done" for entry in entries))
+        self.assertFalse(any("lease release " in call[-1] for call in self.calls()))
 
     def test_command_dies_with_a_killed_client(self):
         os.environ["FAKE_SSH_MODE"] = "extra"
@@ -294,7 +299,7 @@ class RemoteClientTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(process_running(pid))
 
-    def test_sigterm_is_forwarded_to_the_command_and_the_lease_released(self):
+    def test_sigterm_is_forwarded_but_completion_remains_unconfirmed(self):
         ready = self.root / "ready"
         source = ("import pathlib,signal,sys,time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(23)); "
                   "pathlib.Path(sys.argv[1]).touch(); time.sleep(30)")
@@ -306,7 +311,9 @@ class RemoteClientTests(unittest.TestCase):
         child.send_signal(signal.SIGTERM)
         _, stderr = child.communicate(timeout=20)
         self.assertEqual(child.returncode, 23, stderr)
-        self.assertEqual([(event["event"], event.get("reason")) for event in self.events()], [("CLAIM", None), ("RELEASE", "released")])
+        from switchyard.lease_db import LeaseStore
+        current = LeaseStore(self.root / "state" / "leases").current("TESTHANDHELD")
+        self.assertEqual(current["status"], "suspect")
 
     def test_passthrough_preserves_exit_code_stdout_and_adds_detached_attribution(self):
         os.environ["FAKE_SSH_EXIT"] = "1"

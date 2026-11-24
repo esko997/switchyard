@@ -1,8 +1,7 @@
-"""Direct device leases and legacy registry normalization, using only temp ledgers."""
+"""Direct durable device leases and legacy registry normalization, using isolated state."""
 import base64
 from contextlib import redirect_stdout
 from copy import deepcopy
-import fcntl
 import io
 import json
 from pathlib import Path
@@ -17,7 +16,7 @@ from switchyard import collector, operation_worker
 from switchyard.broker import Broker
 from switchyard.core import Service
 from switchyard.host_registry import HostRegistry, authority, encode
-from switchyard.leases import LeaseBusy
+from switchyard.leases import LedgerBroker, LeaseBusy
 
 
 def public_key():
@@ -30,12 +29,12 @@ class DirectLeaseTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
+        self.state = self.root / "state"
         self.hosts = {}
         self.ledgers = {}
         for host_id, device, target in (("host-c", "HOSTC", "operator@192.168.50.69"),
                                         ("host-b", "HOSTB", "operator@192.168.50.233")):
             ledger = self.root / ("DEVICE_ACCESS_" + device + ".md")
-            ledger.write_text("fixture baseline\n")
             self.ledgers[host_id] = ledger
             self.hosts[host_id] = {"host_id": host_id, "transport": "ssh", "target": target,
                                    "ledger": str(ledger), "expected_hostname": host_id,
@@ -49,21 +48,24 @@ class DirectLeaseTests(unittest.TestCase):
         bootstrap = patch("switchyard.host_registry.host_keys.bootstrap", return_value=[public_key()])
         bootstrap.start()
         self.addCleanup(bootstrap.stop)
+        self.lease_broker = LedgerBroker(self.ledgers, state_dir=self.state)
 
     def assert_held(self, host_ids):
         for host_id in host_ids:
-            with self.ledgers[host_id].open("a") as stream:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            label = self.lease_broker.keys[host_id]
+            self.assertEqual(self.lease_broker.store.current(label)["status"], "claimed")
+            with self.assertRaises(LeaseBusy):
+                with self.lease_broker.hold(host_id, owner="other", scope="exclusion fixture", worktree=str(self.root)):
+                    pass
 
     def assert_released(self, host_ids):
+        events = list(reversed(self.lease_broker.store.history()))
         for host_id in host_ids:
-            with self.ledgers[host_id].open("a") as stream:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            entries = [json.loads(line) for line in self.ledgers[host_id].read_text().splitlines()[1:]]
+            label = self.lease_broker.keys[host_id]
+            self.assertIsNone(self.lease_broker.store.current(label))
+            entries = [entry for entry in events if entry["device"] == label]
             self.assertEqual(entries[0]["event"], "CLAIM")
             self.assertEqual(entries[-1]["event"], "RELEASE")
-            self.assertEqual(entries[0]["resource"], host_id)
 
     def test_wrapper_api_removed_and_runtime_schema_refuses_retired_field(self):
         for name in ("_wrapped_input", "LEGACY_WRAPPER", "WRAPPER_SHA256"):
@@ -74,13 +76,12 @@ class DirectLeaseTests(unittest.TestCase):
                 collector._validate_config(legacy)
             with patch.object(collector, "_run", side_effect=AssertionError("No transport")):
                 with self.assertRaises(collector.CollectionError):
-                    collector.collect_host(legacy)
+                    collector.collect_host(legacy, state_dir=self.state)
                 with self.assertRaises(collector.CollectionError):
-                    collector.scan_host_key(legacy, address=config["target"].split("@")[1], port=22)
+                    collector.scan_host_key(legacy, address=config["target"].split("@")[1], port=22, state_dir=self.state)
 
-    def test_collections_hold_canonical_inode_with_direct_ssh_and_receipts(self):
+    def test_collections_hold_durable_claim_with_direct_ssh_and_receipts(self):
         for host_id, config in self.hosts.items():
-            inode = self.ledgers[host_id].stat().st_ino
             def run(command, source, deadline):
                 self.assert_held([host_id])
                 self.assertEqual(command[0], "ssh")
@@ -89,11 +90,11 @@ class DirectLeaseTests(unittest.TestCase):
             evidence = {"observed_at": "2026-11-22T00:00:00+00:00", "coverage": []}
             with self.subTest(host_id=host_id), patch.object(collector, "_run", side_effect=run), \
                     patch.object(collector, "_validate_snapshot", return_value=evidence):
-                self.assertEqual(collector.collect_host(config), evidence)
-            self.assertEqual(self.ledgers[host_id].stat().st_ino, inode)
+                self.assertEqual(collector.collect_host(config, state_dir=self.state), evidence)
+            self.assertFalse(self.ledgers[host_id].exists())
         self.assert_released(self.hosts)
 
-    def test_scans_hold_canonical_inode_and_invoke_keyscan_directly(self):
+    def test_scans_hold_durable_claim_and_invoke_keyscan_directly(self):
         for host_id, config in self.hosts.items():
             def run(command, source, deadline):
                 self.assert_held([host_id])
@@ -101,24 +102,24 @@ class DirectLeaseTests(unittest.TestCase):
                 self.assertEqual(source, b"")
                 return 0, ("fixture " + public_key()).encode()
             with self.subTest(host_id=host_id), patch.object(collector, "_run", side_effect=run):
-                scanned = collector.scan_host_key(config, address=config["target"].split("@")[1], port=22)
+                scanned = collector.scan_host_key(config, address=config["target"].split("@")[1], port=22, state_dir=self.state)
                 self.assertEqual(scanned["keys"], [public_key()])
         self.assert_released(self.hosts)
 
     def test_busy_direct_lease_prevents_collection_and_scan(self):
         for host_id, config in self.hosts.items():
-            with self.subTest(host_id=host_id), self.ledgers[host_id].open("a") as stream:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.subTest(host_id=host_id), self.lease_broker.hold(
+                    host_id, owner="test", scope="busy fixture", worktree=str(self.root)):
                 with patch.object(collector, "_run", side_effect=AssertionError("No transport while busy")):
                     with self.assertRaises(LeaseBusy):
-                        collector.collect_host(config)
+                        collector.collect_host(config, state_dir=self.state)
                     with self.assertRaises(LeaseBusy):
-                        collector.scan_host_key(config, address=config["target"].split("@")[1], port=22)
+                        collector.scan_host_key(config, address=config["target"].split("@")[1], port=22, state_dir=self.state)
 
     def broker(self):
         path = self.root / "operations.json"
         path.write_text(json.dumps({"schema_version": 2, "shell_hosts": list(self.hosts), "workloads": {}}))
-        return Broker(path, hosts=self.hosts, state_dir=self.root / "operations")
+        return Broker(path, hosts=self.hosts, state_dir=self.state / "operations", lease_state_dir=self.state)
 
     def dispatch_worker(self, command, source, **kwargs):
         self.assertEqual(command[0], sys.executable)
@@ -129,9 +130,8 @@ class DirectLeaseTests(unittest.TestCase):
             operation_worker.main()
         return 0, output.getvalue().encode()
 
-    def test_operations_acquire_both_direct_ledgers_before_remote_execution(self):
+    def test_operations_acquire_both_durable_claims_before_remote_execution(self):
         broker = self.broker()
-        inodes = {host: ledger.stat().st_ino for host, ledger in self.ledgers.items()}
         def remote(host, source, request, **kwargs):
             self.assert_held(self.hosts)
             self.assertEqual(host["host_id"], "host-c")
@@ -141,14 +141,13 @@ class DirectLeaseTests(unittest.TestCase):
             result = broker.shell("host-c", "true", extra_host_ids=["host-b"], request_id="direct-operation")
         self.assertEqual(result["receipt"]["status"], "succeeded")
         run.assert_called_once()
-        self.assertEqual(inodes, {host: ledger.stat().st_ino for host, ledger in self.ledgers.items()})
+        self.assertTrue(all(not ledger.exists() for ledger in self.ledgers.values()))
         self.assert_released(self.hosts)
 
     @patch.dict("os.environ", {"SWITCHYARD_OPERATION_LEASE_WAIT": "0"})
     def test_busy_operation_lease_prevents_every_remote_command(self):
         broker = self.broker()
-        with self.ledgers["host-b"].open("a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with self.lease_broker.hold("host-b", owner="test", scope="busy fixture", worktree=str(self.root)):
             with patch("switchyard.broker.run_bounded", side_effect=self.dispatch_worker), \
                     patch.object(operation_worker, "run_remote", side_effect=AssertionError("No remote execution")):
                 result = broker.shell("host-c", "true", extra_host_ids=["host-b"], request_id="busy-direct")
@@ -158,17 +157,14 @@ class DirectLeaseTests(unittest.TestCase):
         # `switchyard lease break` without an attestation blocks the device; brokered operations must honour
         # that, not only agent-facing leases.
         broker = self.broker()
-        leases = self.root / "leases"
-        leases.mkdir(mode=0o700)
-        block = leases / "blocked-HOSTB.json"
-        block.write_text(json.dumps({"device": "HOSTB", "operator": "tester", "at": "2026-11-23T00:00:00+00:00", "reason": "fixture"}))
-        block.chmod(0o600)
+        block = self.lease_broker.store.break_device("HOSTB", operator="tester", reason="fixture")
         with patch("switchyard.broker.run_bounded", side_effect=self.dispatch_worker), \
                 patch.object(operation_worker, "run_remote", side_effect=AssertionError("No remote execution")):
             result = broker.shell("host-c", "true", extra_host_ids=["host-b"], request_id="blocked-direct")
         self.assertEqual(result["receipt"]["status"], "busy")
-        self.assertIn("HOSTB blocked", result["receipt"]["error"])
-        block.unlink()
+        self.assertIn("HOSTB", result["receipt"]["error"])
+        self.assertIn("blocked", result["receipt"]["error"])
+        self.lease_broker.store.clear("HOSTB", operator="tester", attest_stopped="fixture confirmed stopped", expected_block=block)
         with patch("switchyard.broker.run_bounded", side_effect=self.dispatch_worker), \
                 patch.object(operation_worker, "run_remote", return_value={"status": "succeeded", "exit_code": 0, "stdout": "", "stderr": ""}):
             self.assertEqual(broker.shell("host-c", "true", extra_host_ids=["host-b"], request_id="unblocked-direct")["receipt"]["status"], "succeeded")
@@ -244,33 +240,49 @@ class DirectLeaseTests(unittest.TestCase):
 
 class BoundedLeaseWaitTests(unittest.TestCase):
     def test_operation_lease_waits_for_a_brief_holder_but_not_forever(self):
-        import os, subprocess, time
-        from switchyard.leases import LedgerBroker
+        import threading
+        import time
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory).resolve() / "DEVICE_ACCESS_FIXTURE.md"
-            ledger.write_text("")
-            holder = "import fcntl,os,sys,time; fd=os.open(sys.argv[1],os.O_RDWR); fcntl.flock(fd,fcntl.LOCK_EX); print('held',flush=True); time.sleep(float(sys.argv[2]))"
-            broker = LedgerBroker({"fixture": ledger})
+            broker = LedgerBroker({"fixture": ledger}, state_dir=Path(directory) / "state")
             meta = dict(owner="test", scope="wait fixture", worktree=directory)
-            # A monitor-style sub-second holder: a bounded wait acquires once it lets go.
-            brief = subprocess.Popen([sys.executable, "-c", holder, str(ledger), "0.6"], stdout=subprocess.PIPE, text=True)
-            self.assertEqual(brief.stdout.readline().strip(), "held")
-            started = time.monotonic()
-            with broker.hold("fixture", wait=5, **meta):
-                self.assertGreater(time.monotonic() - started, 0.2)
-            brief.wait()
-            # A holder that outlasts the bound still yields LeaseBusy, and no CLAIM is written.
-            long = subprocess.Popen([sys.executable, "-c", holder, str(ledger), "5"], stdout=subprocess.PIPE, text=True)
-            self.assertEqual(long.stdout.readline().strip(), "held")
-            lines = ledger.read_text().count("\n")
-            try:
-                with self.assertRaises(LeaseBusy):
-                    with broker.hold("fixture", wait=0.5, **meta):
-                        pass
-                self.assertEqual(ledger.read_text().count("\n"), lines)
-            finally:
-                long.kill()
-                long.wait()
+            def holder(ready, release, errors):
+                try:
+                    with broker.hold("fixture", **meta):
+                        ready.set()
+                        if not release.wait(5):
+                            raise AssertionError("holder release timed out")
+                except BaseException as error:
+                    errors.append(error)
+                    ready.set()
+            for brief in (True, False):
+                ready, release = threading.Event(), threading.Event()
+                errors = []
+                thread = threading.Thread(target=holder, args=(ready, release, errors))
+                thread.start()
+                timer = None
+                try:
+                    self.assertTrue(ready.wait(2))
+                    self.assertFalse(errors)
+                    if brief:
+                        timer = threading.Timer(0.6, release.set)
+                        timer.start()
+                        started = time.monotonic()
+                        with broker.hold("fixture", wait=5, **meta):
+                            self.assertGreater(time.monotonic() - started, 0.2)
+                    else:
+                        events = broker.store.history()
+                        with self.assertRaises(LeaseBusy):
+                            with broker.hold("fixture", wait=0.5, **meta):
+                                pass
+                        self.assertEqual(broker.store.history(), events)
+                finally:
+                    release.set()
+                    if timer is not None:
+                        timer.join(2)
+                    thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(errors)
             with self.assertRaises(ValueError):
                 with broker.hold("fixture", wait=601, **meta):
                     pass

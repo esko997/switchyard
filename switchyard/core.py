@@ -139,7 +139,8 @@ class Service:
         if not self._store.seeded():
             seed(self._store, catalog=catalog, catalog_sha256=catalog_sha256, catalog_path=catalog_path,
                  host_ids=[record["id"] for record in self._registry_state["hosts"]])
-        self._broker = Broker(operations_path, hosts=self._collectors, state_dir=root / "operations" / space)
+        self._broker = Broker(operations_path, hosts=self._collectors, state_dir=root / "operations" / space,
+                              lease_state_dir=root)
         snapshot = self._read_store()
         self._install_store(self._prepare_store(snapshot), snapshot["revision"])
         self._cache = ObservationCache(root, space)
@@ -367,25 +368,18 @@ class Service:
         return names
 
     def _ledger_configs(self):
-        """Collector configs plus local operation targets: the hosts that name a canonical ledger."""
+        """Collector identity hints plus local operation targets."""
         policy = self._broker._configuration()
         return {**self._collectors, **(self._broker.operation_hosts(policy) if policy else {})}
 
     @_snapshot_view
     def device_locks(self) -> dict:
-        """Read-only holder attribution for local canonical ledgers; never takes a lock."""
-        result = locks.device_locks(paseo_agents=self._paseo_agent_names(), lease_state_dir=self._state_dir / "leases")
-        hosts_by_ledger = {}
-        for host_id, config in self._ledger_configs().items():
-            if config.get("ledger"):
-                hosts_by_ledger.setdefault(str(Path(config["ledger"]).resolve()), []).append(host_id)
-        for ledger in result["ledgers"]:
-            ledger["host_ids"] = sorted(hosts_by_ledger.get(str(Path(ledger["path"]).resolve()), []))
-        return result
+        """Read the shared reservation state without acquiring a device lease."""
+        return self.agent_leases().list()
 
     @_snapshot_view
     def agent_leases(self):
-        """Agent-facing device leases on the same canonical ledgers (see agent_leases.AgentLeases)."""
+        """Agent-facing operations on the same authority as the workers."""
         return AgentLeases(collectors=self._ledger_configs(), state_dir=self._state_dir,
                            hosts=[record["id"] for record in self._registry_state["hosts"]],
                            paseo_agents=self._paseo_agent_names())
@@ -505,7 +499,8 @@ class Service:
             config = deepcopy(self._collectors.get(host_id))
         if not config or config["transport"] != "ssh":
             raise ValueError("Host-key scans require an SSH collector")
-        data = collector.scan_host_key(config, address=config["target"].split("@", 1)[1], port=config.get("port", 22))
+        data = collector.scan_host_key(config, address=config["target"].split("@", 1)[1],
+                                       port=config.get("port", 22), state_dir=self._state_dir)
         keys = data.get("keys")
         if not isinstance(keys, list) or not keys:
             raise ValueError("Host-key scan returned no keys")
@@ -769,7 +764,8 @@ class Service:
     def collect_host(self, host_id: str) -> dict[str, Any]:
         if not isinstance(host_id, str) or host_id not in self._collectors:
             raise ValueError("Host is not configured for collection")
-        observation = self._cache.refresh(host_id, self._collectors[host_id], collect_host)
+        observation = self._cache.refresh(host_id, self._collectors[host_id],
+                                          lambda config: collect_host(config, state_dir=self._state_dir))
         result = self.fleet()
         for host in result["hosts"]:
             if host["id"] == host_id:

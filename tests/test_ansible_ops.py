@@ -1,6 +1,5 @@
-"""Ansible backend: fake uvx/ansible-playbook/ansible-inventory/ssh on PATH, a temp Git repo and temp ledgers."""
+"""Ansible backend: fake uvx/ansible-playbook/ansible-inventory/ssh, a temp Git repo and SQLite leases."""
 import base64
-import fcntl
 import importlib.util
 import json
 import os
@@ -21,7 +20,8 @@ from unittest.mock import patch
 from switchyard import ansible_ops
 from switchyard.ansible_ops import AnsibleOps, outcome, validate_config
 from switchyard.ansible_runner import parse_events
-from switchyard.leases import LeaseBusy
+from switchyard.lease_db import LeaseStore
+from switchyard.leases import LedgerBroker, LeaseBusy
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,7 +37,7 @@ os.execv(str(here / args[2]), [str(here / args[2]), *args[3:]])
 """
 
 FAKE_PLAYBOOK = """
-import fcntl, hashlib, json, os, sys, time
+import hashlib, json, os, sqlite3, sys, time
 from pathlib import Path
 here = Path(__file__).resolve().parent.parent
 args = sys.argv[1:]
@@ -46,14 +46,9 @@ if "--version" in args:
     sys.exit(0)
 mode = "check" if "--check" in args else "apply"
 behaviour = json.loads((here / "playbook.json").read_text())[mode]
-ledger = (here / "ledger").read_text().strip()
-fd = os.open(ledger, os.O_RDONLY)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    held = False
-except BlockingIOError:
-    held = True
-os.close(fd)
+with sqlite3.connect((here / "lease-state").read_text().strip()) as db:
+    row = db.execute("SELECT l.state FROM grants g JOIN leases l ON l.lease_id=g.lease_id WHERE g.label='HOSTA'").fetchone()
+held = row is not None and json.loads(row[0])["status"] == "claimed"
 extra = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
 user_vars = [json.loads(Path(e[1:]).read_text()) for e in extra if e.startswith("@") and "extra-vars" in e]
 # `--become-password-file -`: ansible-core reads the password from stdin to EOF. Log only its digest.
@@ -153,7 +148,7 @@ def git(repo, *args):
 
 
 class AnsibleFixture(unittest.TestCase):
-    """Fake uvx/ansible-playbook/ansible-inventory/ssh, a temp Git repo inside a temp "home", temp ledger and state."""
+    """Fake executables, a temp Git repo inside a temp home, and an isolated SQLite lease authority."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -173,8 +168,6 @@ class AnsibleFixture(unittest.TestCase):
         (bin_dir / "python").write_text(f"#!/bin/sh\nexec {shlex.quote(YAML_PYTHON)} \"$@\"\n")
         (bin_dir / "python").chmod(0o755)
         self.ledger = self.root / "DEVICE_ACCESS_HOSTA.md"
-        self.ledger.write_text("fixture baseline\n")
-        (self.fake / "ledger").write_text(str(self.ledger))
         (self.fake / "ssh_exit").write_text("0")
         self.behave(check={"events": CHECK_EVENTS}, apply={"events": APPLY_EVENTS})
         self.inventory_output({"_meta": {"hostvars": {"test-host-a": {
@@ -195,6 +188,8 @@ class AnsibleFixture(unittest.TestCase):
         git(self.repo, "commit", "-q", "-m", "initial")
         self.state = self.root / "state"
         self.state.mkdir(mode=0o700)
+        self.leases = LeaseStore(self.state / "leases")
+        (self.fake / "lease-state").write_text(str(self.leases.path))
         self.pins = self.state / "pins.known_hosts"
         self.pins.write_text("switchyard-host-a " + public_key() + "\n")
         self.records = [
@@ -234,14 +229,24 @@ class AnsibleFixture(unittest.TestCase):
         path = self.fake / "runs.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def assert_ledger_free(self):
-        fd = os.open(self.ledger, os.O_RDONLY)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        finally:
-            os.close(fd)
-        text = self.ledger.read_text()
-        self.assertEqual(text.count('"event": "CLAIM"'), text.count('"event": "RELEASE"'))
+    def assert_lease_free(self):
+        self.assertIsNone(self.leases.current("HOSTA"))
+        events = self.leases.history()
+        self.assertEqual(sum(event["event"] == "CLAIM" for event in events),
+                         sum(event["event"] == "RELEASE" for event in events))
+
+    def assert_lease_suspect(self):
+        current = self.leases.current("HOSTA")
+        self.assertIsNotNone(current)
+        self.assertEqual(current["status"], "suspect")
+        self.assertTrue(current["suspect"])
+        self.assertTrue(current["suspect_cause"])
+        self.assertFalse(any(event["event"] == "RELEASE" and event.get("lease_id") == current["lease_id"]
+                             for event in self.leases.history()))
+        before = len(self.runs())
+        with self.assertRaises(LeaseBusy):
+            self.ops().probe("host-a", wait=0)
+        self.assertEqual(len(self.runs()), before)
 
 
 class AnsibleOpsTests(AnsibleFixture):
@@ -320,34 +325,48 @@ class AnsibleOpsTests(AnsibleFixture):
         self.assertEqual(run["argv"][run["argv"].index("--limit") + 1], "host-a")
         self.assertTrue(run["ansible_home"].startswith(str(self.state)))
         self.assertEqual(self.ops().plan_record(plan["id"])["check"]["changed_tasks"], ["Install packages"])
-        self.assert_ledger_free()
+        self.assert_lease_free()
+
+    def test_unreachable_check_retains_suspect_and_cannot_authorize_apply(self):
+        self.behave(check={"exit": 4, "events": [
+            result("Gathering Facts", "unreachable"), *finished(unreachable=1)]},
+                    apply={"events": APPLY_EVENTS})
+        ops = self.ops()
+        plan = ops.plan("host-init", "host-a")
+        self.assertFalse(plan["applicable"])
+        self.assertEqual(plan["check"]["unreachable_tasks"], ["Gathering Facts"])
+        self.assertTrue(self.runs()[0]["lease_held"])
+        self.assert_lease_suspect()
+        with self.assertRaisesRegex(ValueError, "not applicable"):
+            ops.apply(plan["id"], approved=True, request_id="unreachable-check")
+        self.assertEqual(ops.receipts(), [])
+        self.assertEqual([run["mode"] for run in self.runs()], ["check"])
 
     def test_busy_lease_executes_nothing(self):
-        fd = os.open(self.ledger, os.O_RDONLY)
-        self.addCleanup(os.close, fd)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        with self.assertRaises(LeaseBusy):
-            self.ops().plan("host-init", "host-a", wait=0)
-        self.assertEqual(self.runs(), [])
+        with LedgerBroker({"host-a": self.ledger}, state_dir=self.state).hold(
+                "host-a", owner="other-agent", scope="fixture contention", worktree=str(self.root)):
+            with self.assertRaises(LeaseBusy):
+                self.ops().plan("host-init", "host-a", wait=0)
+            self.assertEqual(self.leases.current("HOSTA")["owner"], "other-agent")
+            self.assertEqual(self.runs(), [])
+        self.assert_lease_free()
 
     def test_device_blocked_after_lease_break_refuses_probe_plan_and_apply(self):
         # `switchyard lease break` blocks the device until the operator clears it; an Ansible apply could
         # change the host, so it must honour the block exactly like agent leases and brokered operations.
         ops = self.ops()
         plan = ops.plan("host-init", "host-a")
-        leases = self.state / "leases"
-        leases.mkdir(mode=0o700, parents=True, exist_ok=True)
-        block = leases / "blocked-HOSTA.json"
-        block.write_text(json.dumps({"device": "HOSTA", "operator": "tester", "at": "2026-11-23T00:00:00+00:00", "reason": "fixture"}))
-        block.chmod(0o600)
+        self.leases.break_device("HOSTA", operator="tester", reason="fixture operator break")
+        block = self.leases.block("HOSTA")
         before = len(self.runs())
-        for call in (lambda: ops.probe("host-a"), lambda: ops.plan("host-init", "host-a"),
-                     lambda: ops.apply(plan["id"], approved=True, request_id="blocked-1")):
-            with self.assertRaisesRegex(LeaseBusy, "HOSTA blocked"):
+        for call in (lambda: ops.probe("host-a", wait=0), lambda: ops.plan("host-init", "host-a", wait=0),
+                     lambda: ops.apply(plan["id"], approved=True, request_id="blocked-1", wait=0)):
+            with self.assertRaisesRegex(LeaseBusy, "HOSTA: blocked"):
                 call()
         self.assertEqual(len(self.runs()), before)
-        self.assert_ledger_free()
-        block.unlink()
+        self.assert_lease_free()
+        self.leases.clear("HOSTA", operator="tester", attest_stopped="fixture host actions stopped",
+                          expected_block=block)
         self.assertEqual(ops.apply(plan["id"], approved=True, request_id="unblocked-1")["status"], "succeeded")
 
     def test_become_without_passwordless_sudo_prints_operator_command_and_runs_nothing(self):
@@ -366,7 +385,7 @@ class AnsibleOpsTests(AnsibleFixture):
         with self.assertRaisesRegex(ValueError, "not applicable"):
             ops.apply(plan["id"], approved=True, request_id="r-1")
         self.assertIn("sudo -n true", (self.fake / "ssh.log").read_text())
-        self.assert_ledger_free()
+        self.assert_lease_free()
 
     def test_operator_run_is_recorded_from_its_events(self):
         (self.fake / "ssh_exit").write_text("10")
@@ -425,7 +444,7 @@ class AnsibleOpsTests(AnsibleFixture):
         self.assertEqual([run["mode"] for run in self.runs()], ["check", "apply"])
         self.assertTrue(self.runs()[1]["lease_held"])
         self.assertEqual(ops.receipt("r-1")["id"], receipt["id"])
-        self.assert_ledger_free()
+        self.assert_lease_free()
 
     def test_failed_apply_releases_the_lease_and_records_changed_tasks(self):
         self.behave(check={"events": CHECK_EVENTS}, apply={"exit": 2, "events": [
@@ -437,8 +456,9 @@ class AnsibleOpsTests(AnsibleFixture):
         self.assertEqual(receipt["failed_tasks"], ["Configure xrdp"])
         self.assertEqual(receipt["changed_tasks"], ["Install packages"])
         self.assertTrue(self.runs()[1]["lease_held"])
-        self.assert_ledger_free()
-        self.assertIn('"ansible_status": "failed"', self.ledger.read_text())
+        self.assert_lease_free()
+        release = next(event for event in self.leases.history() if event["event"] == "RELEASE")
+        self.assertEqual(release["details"]["ansible_status"], "failed")
 
     def test_timeout_kills_runner_and_needs_inspection(self):
         self.behave(check={"events": CHECK_EVENTS}, apply={"sleep": 30, "events": [result("Install packages", "changed")]})
@@ -449,7 +469,22 @@ class AnsibleOpsTests(AnsibleFixture):
         self.assertLess(time.monotonic() - started, 15)
         self.assertEqual(receipt["status"], "needs-inspection")
         self.assertTrue(receipt["timed_out"])
-        self.assert_ledger_free()
+        self.assert_lease_suspect()
+
+    def test_connection_loss_during_apply_retains_suspect_and_the_receipt(self):
+        self.behave(check={"events": CHECK_EVENTS}, apply={"exit": 4, "events": [
+            result("Gathering Facts", "ok"), result("Install packages", "unreachable"),
+            *finished(ok=1, unreachable=1)]})
+        ops = self.ops()
+        plan = ops.plan("host-init", "host-a")
+        receipt = ops.apply(plan["id"], approved=True, request_id="lost-connection")
+        self.assertEqual(receipt["status"], "needs-inspection")
+        self.assertEqual(receipt["unreachable_tasks"], ["Install packages"])
+        self.assertEqual(ops.receipt("lost-connection")["id"], receipt["id"])
+        self.assert_lease_suspect()
+        replay = ops.apply(plan["id"], approved=True, request_id="lost-connection")
+        self.assertEqual((replay["id"], replay["replayed"]), (receipt["id"], True))
+        self.assertEqual([run["mode"] for run in self.runs()], ["check", "apply"])
 
     def test_extra_var_values_are_never_stored_or_printed(self):
         secret = "s3cr3t-token-value"
@@ -494,7 +529,7 @@ class AnsibleOpsTests(AnsibleFixture):
         with self.assertRaises(SystemExit):
             ops.apply(plan["id"], approved=True, request_id="r-1")
         self.assertEqual(ops.receipt("r-1")["status"], "needs-inspection")
-        self.assert_ledger_free()
+        self.assert_lease_suspect()
 
     def test_outcome_distinguishes_unreachable_before_and_during_the_run(self):
         early = {"stats": {"host-a": {"unreachable": 1}}, "ended": 1, "no_hosts_matched": False,
