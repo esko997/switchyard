@@ -1,0 +1,17 @@
+[Unit]
+Description=Switchyard disposable Quadlet lifecycle probe
+
+[Container]
+Image=4a0915357175dbe21d4a8a05fd0438580f6dbb950011b8f3e6495551ab22408f
+ContainerName=switchyard-quadlet-smoke
+Exec=/bin/sh -c "trap 'exit 0' TERM INT; sleep infinity & wait"
+Network=none
+ReadOnly=true
+PodmanArgs=--pull=never --stop-signal=SIGTERM
+
+[Service]
+Restart=no
+MemoryMax=96M
+CPUQuota=5%
+TimeoutStartSec=30
+TimeoutStopSec=15

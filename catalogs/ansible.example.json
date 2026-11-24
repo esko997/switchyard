@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "runner": {
+    "ansible_core": "2.19.15",
+    "collections": []
+  },
+  "playbooks": {
+    "host-init": {
+      "description": "Fictional host initialization playbook (site.yml, role base_host). Needs sudo; check mode is partial (package installs and service reloads are not predicted).",
+      "repo": "~/src/host-init",
+      "playbook": "site.yml",
+      "inventory": "inventories/hosts.yml",
+      "groups": ["managed_hosts"],
+      "allowed_hosts": ["destination"],
+      "become": true,
+      "check_mode": "partial",
+      "extra_vars_allowed": []
+    }
+  }
+}

@@ -1,0 +1,341 @@
+{
+  "apiVersion": "switchyard/v1alpha3", "kind": "Bundle",
+  "applications": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "Application",
+    "id": "test-agent-cluster", "revision": 1,
+    "name": "TEST agent cluster: hub, station and four residents",
+    "purpose": "Synthetic TEST deployment: a Test Hub hub with TEST_ALICE and TEST_BOB on host-c; a station with TEST_CAROL and TEST_DAVE on host-a; separate caretakers and disposable TEST_CLIENT identities. Declared schema example, not deployment evidence or an activation grant.",
+    "components": [
+      {"id": "hub", "native": {"kind": "systemd", "unit": "test-hub.service", "source": "test-hub-unit"}, "depends_on": ["video"],
+       "gates": [{"id": "g5-test-hub", "kind": "exec-start-pre", "target": "test-hub.service.d/generation-gate.conf",
+                  "covers": "Boot, manual start and Restart= of test-hub.service; also checks TEST_HUB_ROLE so a station cannot start as a second hub.",
+                  "misses": "A Test Hub started by hand with bun src/server.ts."}]},
+      {"id": "video", "native": {"kind": "systemd", "unit": "resident-video.service", "source": "video-unit"},
+       "gates": [{"id": "g5-video", "kind": "exec-start-pre", "target": "resident-video.service.d/generation-gate.conf",
+                  "covers": "Boot, manual start, Restart= and the Wants= pull-in from test-hub.service.",
+                  "misses": "MediaMTX started by hand."}]},
+      {"id": "station", "native": {"kind": "systemd", "unit": "test-hub.service", "source": "test-hub-unit"},
+       "gates": [{"id": "g5-test-hub", "kind": "exec-start-pre", "target": "test-hub.service.d/generation-gate.conf",
+                  "covers": "Boot, manual start and Restart= of test-hub.service; checks TEST_HUB_ROLE=station.",
+                  "misses": "A Test Hub started by hand with bun src/server.ts."}]},
+      {"id": "test-alice", "native": {"kind": "systemd", "unit": "test-alice-run.service", "unit_type": "transient", "related_units": ["resident-client@TEST_ALICE.service"], "launcher": {"id": "resident-launcher", "command_ref": "start-resident-run"}}, "depends_on": ["hub"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "resident-launcher (full-client/tools/start-run.sh, before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g2-session", "kind": "script", "target": "run-session.sh (after argument validation, before the SESSION_HEALTH_CHILD branch)", "covers": "Every session start: launcher, hand-typed systemd-run, old run-until.sh and every health-watch.py restart; refusal exits 12 (generation_fenced).", "misses": "Direct body starts."},
+         {"id": "g3-body", "kind": "exec-start-pre", "target": "resident-client@.service.d/generation-gate.conf (instance TEST_ALICE -> component test-alice)", "covers": "Direct systemctl --user start resident-client@TEST_ALICE and every path that starts a body.", "misses": "Raw test-game-launcher/Java started by hand."}
+       ]},
+      {"id": "test-bob", "native": {"kind": "systemd", "unit": "test-bob-run.service", "unit_type": "transient", "related_units": ["resident-client@TEST_BOB.service"], "launcher": {"id": "resident-launcher", "command_ref": "start-resident-run"}}, "depends_on": ["hub"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "resident-launcher (full-client/tools/start-run.sh, before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g2-session", "kind": "script", "target": "run-session.sh (after argument validation, before the SESSION_HEALTH_CHILD branch)", "covers": "Every session start including every health-watch.py restart; refusal exits 12 (generation_fenced).", "misses": "Direct body starts."},
+         {"id": "g3-body", "kind": "exec-start-pre", "target": "resident-client@.service.d/generation-gate.conf (instance TEST_BOB -> component test-bob)", "covers": "Direct systemctl --user start resident-client@TEST_BOB and every path that starts a body.", "misses": "Raw test-game-launcher/Java started by hand."}
+       ]},
+      {"id": "test-carol", "native": {"kind": "systemd", "unit": "test-carol-run.service", "unit_type": "transient", "related_units": ["resident-client@TEST_CAROL.service"], "launcher": {"id": "resident-launcher", "command_ref": "start-resident-run"}}, "depends_on": ["hub", "station"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "resident-launcher (full-client/tools/start-run.sh, before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g2-session", "kind": "script", "target": "run-session.sh (after argument validation, before the SESSION_HEALTH_CHILD branch)", "covers": "Every session start including every health-watch.py restart; refusal exits 12 (generation_fenced).", "misses": "Direct body starts."},
+         {"id": "g3-body", "kind": "exec-start-pre", "target": "resident-client@.service.d/generation-gate.conf (instance TEST_CAROL -> component test-carol)", "covers": "Direct systemctl --user start resident-client@TEST_CAROL and every path that starts a body.", "misses": "Raw test-game-launcher/Java started by hand."}
+       ]},
+      {"id": "test-dave", "native": {"kind": "systemd", "unit": "test-dave-run.service", "unit_type": "transient", "related_units": ["resident-client@TEST_DAVE.service"], "launcher": {"id": "resident-launcher", "command_ref": "start-resident-run"}}, "depends_on": ["hub", "station"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "resident-launcher (full-client/tools/start-run.sh, before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g2-session", "kind": "script", "target": "run-session.sh (after argument validation, before the SESSION_HEALTH_CHILD branch)", "covers": "Every session start including every health-watch.py restart; refusal exits 12 (generation_fenced).", "misses": "Direct body starts."},
+         {"id": "g3-body", "kind": "exec-start-pre", "target": "resident-client@.service.d/generation-gate.conf (instance TEST_DAVE -> component test-dave)", "covers": "Direct systemctl --user start resident-client@TEST_DAVE and every path that starts a body.", "misses": "Raw test-game-launcher/Java started by hand."}
+       ]},
+      {"id": "hub-caretaker", "native": {"kind": "systemd", "unit": "overseer-run.service", "unit_type": "transient", "launcher": {"id": "caretaker-launcher", "command_ref": "start-caretaker-run"}}, "depends_on": ["hub"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "caretaker-launcher (before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g4-caretaker", "kind": "script", "target": "overseer-loop.sh (at start and before each pass)", "covers": "Every loop start; revocation takes effect within one interval.", "misses": "overseer.sh run by hand (duplicate speech and hub central jobs)."}
+       ]},
+      {"id": "station-caretaker", "native": {"kind": "systemd", "unit": "overseer-run.service", "unit_type": "transient", "launcher": {"id": "caretaker-launcher", "command_ref": "start-caretaker-run"}}, "depends_on": ["hub"],
+       "gates": [
+         {"id": "g1-launcher", "kind": "launcher", "target": "caretaker-launcher (before systemd-run)", "covers": "The supported start path.", "misses": "Anything that does not use the launcher."},
+         {"id": "g4-caretaker", "kind": "script", "target": "overseer-loop.sh (at start and before each pass)", "covers": "Every loop start; revocation takes effect within one interval.", "misses": "overseer.sh run by hand."}
+       ]},
+      {"id": "hub-test-client", "native": {"kind": "systemd", "unit": "PLACEHOLDER-test-client-start-path-on-host-c"}},
+      {"id": "station-test-client", "native": {"kind": "systemd", "unit": "PLACEHOLDER-test-client-start-path-on-host-a"}}
+    ],
+    "identities": [
+      {"id": "mc-test-alice", "kind": "minecraft-user", "name": "TEST_ALICE", "holders": ["test-alice"], "description": "TEST_ALICE's Minecraft login (offline-mode server: any LAN host can log in as TEST_ALICE)."},
+      {"id": "mc-test-bob", "kind": "minecraft-user", "name": "TEST_BOB", "holders": ["test-bob"], "description": "TEST_BOB's Minecraft login."},
+      {"id": "mc-test-carol", "kind": "minecraft-user", "name": "TEST_CAROL", "holders": ["test-carol"], "description": "TEST_CAROL's Minecraft login."},
+      {"id": "mc-test-dave", "kind": "minecraft-user", "name": "TEST_DAVE", "holders": ["test-dave"], "description": "TEST_DAVE's Minecraft login."},
+      {"id": "mc-test-client", "kind": "minecraft-user", "name": "TEST_CLIENT", "holders": ["hub-test-client", "station-test-client"], "description": "Test identity with a game-test directory on both hosts; at most one test client may be active."},
+      {"id": "thread-test-alice", "kind": "codex-thread", "name": "PLACEHOLDER-test-alice-thread-id", "holders": ["test-alice"], "description": "TEST_ALICE's resumable agent runtime thread in the hub agent-home."},
+      {"id": "thread-test-bob", "kind": "codex-thread", "name": "PLACEHOLDER-test-bob-thread-id", "holders": ["test-bob"], "description": "TEST_BOB's resumable agent runtime thread in the hub agent-home."},
+      {"id": "thread-test-carol", "kind": "codex-thread", "name": "PLACEHOLDER-test-carol-thread-id", "holders": ["test-carol"], "description": "TEST_CAROL's resumable agent runtime thread in the station agent-home."},
+      {"id": "thread-test-dave", "kind": "codex-thread", "name": "PLACEHOLDER-test-dave-thread-id", "holders": ["test-dave"], "description": "TEST_DAVE's resumable agent runtime thread in the station agent-home."}
+    ],
+    "datasets": [
+      {
+        "id": "hub-state", "snapshot": "sqlite-backup", "verify": "manifest-and-sqlite",
+        "writers": ["hub", "hub-caretaker"],
+        "external_actors": [{"id": "controller-wrapup", "description": "Wrap-up scripts on Controller read test-hub.sqlite over SSH with a mode=ro URI.", "access": "read"}]
+      },
+      {"id": "station-state", "snapshot": "sqlite-backup", "verify": "manifest-and-sqlite", "writers": ["station"]},
+      {"id": "hub-agent-home", "snapshot": "files-quiesced", "verify": "manifest-and-sqlite", "writers": ["test-alice", "test-bob", "hub-caretaker"], "readers": ["hub"]},
+      {"id": "station-agent-home", "snapshot": "files-quiesced", "verify": "manifest-and-sqlite", "writers": ["test-carol", "test-dave", "station-caretaker"], "readers": ["station"]},
+      {
+        "id": "hub-continuity", "snapshot": "files-quiesced", "verify": "sha256-manifest",
+        "writers": ["test-alice", "test-bob", "hub-caretaker"], "readers": ["hub"],
+        "include": ["resident/**", "sessions/**", "calls/**", "game/**", "game-TEST_BOB/**", "overseer/*.md", "overseer/last-*.log", "overseer/speak"],
+        "exclude": ["**/auth.json", "**/.Xauthority"],
+        "external_actors": [{"id": "controller-notes-rsync", "description": "Wrap-up rsync copies resident notes from this host into the repository on Controller.", "access": "read"}],
+        "health_files": [
+          {"id": "test-alice-health", "path": "sessions/TEST_ALICE-health.json", "stale_on_restore": true},
+          {"id": "test-bob-health", "path": "sessions/TEST_BOB-health.json", "stale_on_restore": true}
+        ]
+      },
+      {
+        "id": "station-continuity", "snapshot": "files-quiesced", "verify": "sha256-manifest",
+        "writers": ["test-carol", "test-dave", "station-caretaker"], "readers": ["station"],
+        "include": ["resident/**", "sessions/**", "calls/**", "game-TEST_CAROL/**", "game-TEST_DAVE/**", "overseer/*.md", "overseer/last-*.log", "overseer/speak"],
+        "exclude": ["**/auth.json", "**/.Xauthority", "game-test/**"],
+        "external_actors": [{"id": "controller-notes-rsync", "description": "Wrap-up rsync copies resident notes from this host into the repository on Controller.", "access": "read"}],
+        "health_files": [
+          {"id": "test-carol-health", "path": "sessions/TEST_CAROL-health.json", "stale_on_restore": true},
+          {"id": "test-dave-health", "path": "sessions/TEST_DAVE-health.json", "stale_on_restore": true}
+        ]
+      }
+    ],
+    "secrets": [
+      {"id": "hub-dashboard-token", "kind": "file", "consumers": ["hub"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "hub-state", "form": "value", "role": "holder", "component": "hub", "dataset": "hub-state"}]},
+      {"id": "station-dashboard-token", "kind": "file", "consumers": ["station"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [
+         {"id": "station-state", "form": "value", "role": "holder", "component": "station", "dataset": "station-state"},
+         {"id": "hub-stations-file", "form": "embedded", "role": "copy", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "hub-observer-token", "kind": "file", "consumers": ["hub"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "hub-state", "form": "value", "role": "holder", "component": "hub", "dataset": "hub-state"},
+         {"id": "server-config", "form": "hash", "role": "verifier", "external_dependency": "server-bridge"}
+       ]},
+      {"id": "hub-agent-auth", "kind": "credential", "consumers": ["test-alice", "test-bob", "hub-caretaker"], "transfer": "reissue", "rotates_on_use": "unknown",
+       "locations": [{"id": "agent-home", "form": "value", "role": "holder", "component": "test-alice", "dataset": "hub-agent-home"}]},
+      {"id": "station-agent-auth", "kind": "credential", "consumers": ["test-carol", "test-dave", "station-caretaker"], "transfer": "reissue", "rotates_on_use": "unknown",
+       "locations": [{"id": "agent-home", "form": "value", "role": "holder", "component": "test-carol", "dataset": "station-agent-home"}]},
+      {"id": "hub-env", "kind": "environment-file", "consumers": ["hub", "hub-caretaker"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "env-file", "form": "value", "role": "holder", "component": "hub"}]},
+      {"id": "phone-chat-token", "kind": "credential", "consumers": ["hub"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [
+         {"id": "hub-env-chat-url", "form": "embedded", "role": "holder", "component": "hub"},
+         {"id": "phone-chat-service", "form": "value", "role": "verifier", "external_dependency": "phone-chat"}
+       ]},
+      {"id": "station-env", "kind": "environment-file", "consumers": ["station", "station-caretaker"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "env-file", "form": "value", "role": "holder", "component": "station"}]},
+      {"id": "hub-caretaker-env", "kind": "environment-file", "consumers": ["hub-caretaker"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "env-file", "form": "value", "role": "holder", "component": "hub-caretaker"}]},
+      {"id": "station-caretaker-env", "kind": "environment-file", "consumers": ["station-caretaker"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "env-file", "form": "value", "role": "holder", "component": "station-caretaker"}]},
+      {"id": "hub-caretaker-token", "kind": "file", "consumers": ["hub-caretaker"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "hub-caretaker"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "station-caretaker-token", "kind": "file", "consumers": ["station-caretaker"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "station-caretaker"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "test-alice-api-token", "kind": "file", "consumers": ["test-alice"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "test-alice"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "test-bob-api-token", "kind": "file", "consumers": ["test-bob"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "test-bob"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "test-carol-api-token", "kind": "file", "consumers": ["test-carol"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "test-carol"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "test-dave-api-token", "kind": "file", "consumers": ["test-dave"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [
+         {"id": "token-file", "form": "value", "role": "holder", "component": "test-dave"},
+         {"id": "hub-credentials", "form": "hash", "role": "verifier", "component": "hub", "dataset": "hub-state"}
+       ]},
+      {"id": "hub-test-bridge-token", "kind": "file", "consumers": ["hub", "test-alice", "test-bob"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [{"id": "token-file", "form": "value", "role": "holder", "component": "hub"}]},
+      {"id": "station-test-bridge-token", "kind": "file", "consumers": ["station", "test-carol", "test-dave"], "transfer": "reissue", "rotates_on_use": false,
+       "locations": [{"id": "token-file", "form": "value", "role": "holder", "component": "station"}]},
+      {"id": "hub-xauthority", "kind": "file", "consumers": ["test-alice", "test-bob"], "transfer": "operator-provides", "rotates_on_use": "unknown",
+       "locations": [{"id": "xauthority", "form": "value", "role": "holder", "component": "test-alice"}]},
+      {"id": "station-xauthority", "kind": "file", "consumers": ["test-carol", "test-dave"], "transfer": "operator-provides", "rotates_on_use": "unknown",
+       "locations": [{"id": "xauthority", "form": "value", "role": "holder", "component": "test-carol"}]}
+    ],
+    "endpoints": [
+      {"id": "hub-http", "component": "hub", "protocol": "tcp", "target_port": 8770, "consumers": ["Dashboard bookmark/PWA with secret path", "Resident API callers on both hosts (TEST_HUB_URL)", "Station caretaker", "Controller wrap-up scripts"]},
+      {"id": "station-http", "component": "station", "protocol": "tcp", "target_port": 8770, "consumers": ["Hub stations.json secret station URL"]},
+      {"id": "test-alice-test-bridge", "component": "test-alice", "protocol": "tcp", "target_port": 25599, "consumers": ["TEST_ALICE toolserver", "hub Watcher and Live"]},
+      {"id": "test-bob-test-bridge", "component": "test-bob", "protocol": "tcp", "target_port": 25610, "consumers": ["TEST_BOB toolserver", "hub Watcher and Live"]},
+      {"id": "test-carol-test-bridge", "component": "test-carol", "protocol": "tcp", "target_port": 25600, "consumers": ["TEST_CAROL toolserver", "station Watcher"]},
+      {"id": "test-dave-test-bridge", "component": "test-dave", "protocol": "tcp", "target_port": 25610, "consumers": ["TEST_DAVE toolserver", "station Watcher"]},
+      {"id": "station-test-test-bridge", "component": "station-test-client", "protocol": "tcp", "target_port": 25620, "consumers": ["TEST_CLIENT toolserver"]},
+      {"id": "live-rtsp", "component": "video", "protocol": "tcp", "target_port": 8554, "consumers": ["Test Hub FFmpeg publisher", "optional loopback OBS reader"]},
+      {"id": "live-whep", "component": "video", "protocol": "tcp", "target_port": 8889, "consumers": ["Test Hub WHEP proxy"]},
+      {"id": "live-media-udp", "component": "video", "protocol": "udp", "target_port": 8189, "consumers": ["LAN WebRTC viewers"]},
+      {"id": "live-media-tcp", "component": "video", "protocol": "tcp", "target_port": 8189, "consumers": ["LAN WebRTC viewers"]}
+    ],
+    "requires": [
+      {"name": "user-manager.linger", "probe_ref": "loginctl show-user operator -p Linger"},
+      {"name": "display.x11-logged-in-unlocked-seat0", "components": ["test-alice", "test-bob", "test-carol", "test-dave"], "probe_ref": "PLACEHOLDER-real-GL-session-and-connected-output-probe"},
+      {"name": "resident.client-capacity", "components": ["test-alice", "test-bob", "test-carol", "test-dave"], "capacity": {"memory_mib": 5120, "gpu": "hardware OpenGL 4.6 for a real Forge 1.20.1 client; 4 GiB heap; configure deployment-specific memory limits"}},
+      {"name": "hub.live-encoder", "components": ["hub"], "capacity": {"gpu": "FFmpeg h264_nvenc child of Test Hub (compatible NVIDIA GPU)"}, "probe_ref": "PLACEHOLDER-decoded-frames-and-encoder-exit"}
+    ],
+    "external_dependencies": [
+      {"id": "minecraft-server", "description": "test-game-server Compose project on host-b, 192.168.50.233:25570, synthetic Forge server. Authoritative world; never moved or rolled back by this application.", "probe_ref": "PLACEHOLDER-server-ready-probe"},
+      {"id": "server-bridge", "description": "test_observer-0.1.0.jar and config inside the same Compose project, 192.168.50.233:25640; config read at server start only, so reissuing the observer token needs a server restart.", "probe_ref": "GET /v1/status with the hub observer token", "secret_ref": "hub-observer-token"},
+      {"id": "phone-chat", "description": "test-chat.service on host-b :8766; console and RCON bridge (podman exec rcon-cli) used by the hub Console and caretaker speech. Its token travels inside CHAT_URL in the hub env file.", "secret_ref": "phone-chat-token"},
+      {"id": "codex-backend", "description": "ChatGPT subscription login per host for agent runtime minds and caretakers; threads live in each host's agent-home.", "secret_ref": "hub-agent-auth"}
+    ],
+    "health_checks": [
+      {"id": "hub-api", "component": "hub", "type": "http", "endpoint": "hub-http", "path": "/resident-api/v1/caretaker/digest?resident=TEST_ALICE", "credential_ref": "hub-caretaker-token", "predicate_ref": "PLACEHOLDER-digest-shape-and-station-federation-fresh"},
+      {"id": "hub-quiesced", "component": "hub", "type": "predicate", "predicate_ref": "PLACEHOLDER-test-hub-and-hub-caretaker-central-jobs-stopped"},
+      {"id": "hub-state-verified", "component": "hub", "type": "predicate", "predicate_ref": "PLACEHOLDER-sqlite-integrity-and-manifest"},
+      {"id": "station-port", "component": "station", "type": "tcp", "endpoint": "station-http"},
+      {"id": "video-whep", "component": "video", "type": "tcp", "endpoint": "live-whep"},
+      {"id": "test-alice-fresh", "component": "test-alice", "type": "file-freshness", "dataset": "hub-continuity", "health_file": "test-alice-health", "max_age_seconds": 60},
+      {"id": "test-bob-fresh", "component": "test-bob", "type": "file-freshness", "dataset": "hub-continuity", "health_file": "test-bob-health", "max_age_seconds": 60},
+      {"id": "test-carol-fresh", "component": "test-carol", "type": "file-freshness", "dataset": "station-continuity", "health_file": "test-carol-health", "max_age_seconds": 60},
+      {"id": "test-dave-fresh", "component": "test-dave", "type": "file-freshness", "dataset": "station-continuity", "health_file": "test-dave-health", "max_age_seconds": 60},
+      {"id": "test-alice-healthy", "component": "test-alice", "type": "predicate", "predicate_ref": "PLACEHOLDER-health-json-status-healthy-and-new-body-calls"},
+      {"id": "test-bob-healthy", "component": "test-bob", "type": "predicate", "predicate_ref": "PLACEHOLDER-health-json-status-healthy-and-new-body-calls"},
+      {"id": "test-carol-healthy", "component": "test-carol", "type": "predicate", "predicate_ref": "PLACEHOLDER-health-json-status-healthy-and-new-body-calls"},
+      {"id": "test-dave-healthy", "component": "test-dave", "type": "predicate", "predicate_ref": "PLACEHOLDER-health-json-status-healthy-and-new-body-calls"},
+      {"id": "hub-caretaker-active", "component": "hub-caretaker", "type": "unit-state", "predicate_ref": "overseer-run.service active"},
+      {"id": "station-caretaker-active", "component": "station-caretaker", "type": "unit-state", "predicate_ref": "overseer-run.service active"}
+    ],
+    "consistency_groups": [
+      {"id": "hub-group", "datasets": ["hub-state", "hub-agent-home", "hub-continuity"]},
+      {"id": "station-group", "datasets": ["station-state", "station-agent-home", "station-continuity"]}
+    ],
+    "recipes": [
+      {
+        "id": "hub-state-online-backup", "revision": 1,
+        "steps": [
+          {"id": "snapshot-hub-state", "action": "snapshot", "target": {"kind": "dataset", "id": "hub-state"}, "idempotent": false, "checks": ["hub-state-verified"]},
+          {"id": "verify-hub-state", "action": "verify", "target": {"kind": "dataset", "id": "hub-state"}, "idempotent": true, "checks": ["hub-state-verified"]}
+        ]
+      },
+      {
+        "id": "run-start", "revision": 1,
+        "steps": [
+          {"id": "check-hub", "action": "verify", "target": {"kind": "component", "id": "hub"}, "idempotent": true, "checks": ["hub-api"]},
+          {"id": "start-test-alice", "action": "start", "target": {"kind": "component", "id": "test-alice"}, "idempotent": false, "checks": ["test-alice-fresh", "test-alice-healthy"]},
+          {"id": "start-test-bob", "action": "start", "target": {"kind": "component", "id": "test-bob"}, "idempotent": false, "checks": ["test-bob-fresh", "test-bob-healthy"]},
+          {"id": "start-test-carol", "action": "start", "target": {"kind": "component", "id": "test-carol"}, "idempotent": false, "checks": ["test-carol-fresh", "test-carol-healthy"]},
+          {"id": "start-test-dave", "action": "start", "target": {"kind": "component", "id": "test-dave"}, "idempotent": false, "checks": ["test-dave-fresh", "test-dave-healthy"]},
+          {"id": "start-hub-caretaker", "action": "start", "target": {"kind": "component", "id": "hub-caretaker"}, "idempotent": false, "checks": ["hub-caretaker-active"]},
+          {"id": "start-station-caretaker", "action": "start", "target": {"kind": "component", "id": "station-caretaker"}, "idempotent": false, "checks": ["station-caretaker-active"]}
+        ]
+      }
+    ],
+    "provenance": {
+      "submitted_by": "test-operator",
+      "source": "synthetic-residents-example",
+      "evidence": [
+        "Synthetic fixtures only; no host inspection, saved run data or credentials are included.",
+        "Generation gates and resource relationships illustrate validation requirements, not an installed deployment."
+      ]
+    }
+  }],
+  "placements": [
+    {
+      "apiVersion": "switchyard/v1alpha3", "kind": "Placement",
+      "id": "test-cluster-hub", "application_id": "test-agent-cluster", "revision": 1,
+      "host_id": "host-c", "generation": 1, "state": "declared", "ownership": "adopted",
+      "components": [
+        {"component": "hub", "native_identities": [{"native_id": "test-hub.service", "scope": "user:1000"}], "source_paths": {"test-hub-unit": "/home/operator/.config/systemd/user/test-hub.service"}},
+        {"component": "video", "native_identities": [{"native_id": "resident-video.service", "scope": "user:1000"}], "source_paths": {"video-unit": "/home/operator/.config/systemd/user/resident-video.service"}},
+        {"component": "test-alice", "native_identities": [{"native_id": "test-alice-run.service", "scope": "user:1000"}, {"native_id": "resident-client@TEST_ALICE.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "test-bob", "native_identities": [{"native_id": "test-bob-run.service", "scope": "user:1000"}, {"native_id": "resident-client@TEST_BOB.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "hub-caretaker", "native_identities": [{"native_id": "overseer-run.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "hub-test-client", "native_identities": [{"native_id": "PLACEHOLDER-test-client-process-on-host-c", "scope": "user:1000"}]}
+      ],
+      "datasets": [
+        {"dataset": "hub-state", "path": "/home/operator/resident-client/test-hub-data", "access": "write", "ownership": "native"},
+        {"dataset": "hub-agent-home", "path": "/home/operator/resident-client/agent-home", "access": "write", "ownership": "native"},
+        {"dataset": "hub-continuity", "path": "/home/operator/resident-client", "access": "write", "ownership": "native"}
+      ],
+      "secrets": [
+        {"secret": "hub-dashboard-token", "location": "hub-state", "relative_path": "token"},
+        {"secret": "station-dashboard-token", "location": "hub-stations-file", "relative_path": "stations.json"},
+        {"secret": "hub-observer-token", "location": "hub-state", "relative_path": "observer.token"},
+        {"secret": "hub-agent-auth", "location": "agent-home", "relative_path": "auth.json"},
+        {"secret": "hub-env", "location": "env-file", "path": "/home/operator/.config/test-hub/env"},
+        {"secret": "phone-chat-token", "location": "hub-env-chat-url", "path": "/home/operator/.config/test-hub/env"},
+        {"secret": "hub-caretaker-env", "location": "env-file", "path": "/home/operator/.config/test-hub/caretaker.env"},
+        {"secret": "hub-caretaker-token", "location": "token-file", "path": "/home/operator/.config/test-hub/caretaker.token"},
+        {"secret": "hub-caretaker-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "station-caretaker-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "test-alice-api-token", "location": "token-file", "path": "/home/operator/resident-client/test-hub-tokens/TEST_ALICE"},
+        {"secret": "test-alice-api-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "test-bob-api-token", "location": "token-file", "path": "/home/operator/resident-client/test-hub-tokens/TEST_BOB"},
+        {"secret": "test-bob-api-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "test-carol-api-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "test-dave-api-token", "location": "hub-credentials", "relative_path": "credentials.json"},
+        {"secret": "hub-test-bridge-token", "location": "token-file", "path": "/home/operator/.test-bridge/token"},
+        {"secret": "hub-xauthority", "location": "xauthority", "path": "/home/operator/.Xauthority"}
+      ],
+      "endpoints": [
+        {"endpoint": "hub-http", "address": "0.0.0.0", "host_port": 8770},
+        {"endpoint": "test-alice-test-bridge", "address": "127.0.0.1", "host_port": 25599},
+        {"endpoint": "test-bob-test-bridge", "address": "127.0.0.1", "host_port": 25610},
+        {"endpoint": "live-rtsp", "address": "127.0.0.1", "host_port": 8554},
+        {"endpoint": "live-whep", "address": "127.0.0.1", "host_port": 8889},
+        {"endpoint": "live-media-udp", "address": "::", "host_port": 8189},
+        {"endpoint": "live-media-tcp", "address": "::", "host_port": 8189}
+      ]
+    },
+    {
+      "apiVersion": "switchyard/v1alpha3", "kind": "Placement",
+      "id": "test-cluster-station", "application_id": "test-agent-cluster", "revision": 1,
+      "host_id": "host-a", "generation": 1, "state": "declared", "ownership": "adopted",
+      "components": [
+        {"component": "station", "native_identities": [{"native_id": "test-hub.service", "scope": "user:1000"}], "source_paths": {"test-hub-unit": "/home/operator/.config/systemd/user/test-hub.service"}},
+        {"component": "test-carol", "native_identities": [{"native_id": "test-carol-run.service", "scope": "user:1000"}, {"native_id": "resident-client@TEST_CAROL.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "test-dave", "native_identities": [{"native_id": "test-dave-run.service", "scope": "user:1000"}, {"native_id": "resident-client@TEST_DAVE.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "station-caretaker", "native_identities": [{"native_id": "overseer-run.service", "scope": "user:1000"}], "launcher_path": "PLACEHOLDER-repo-owned-launcher-not-yet-on-host"},
+        {"component": "station-test-client", "native_identities": [{"native_id": "PLACEHOLDER-test-client-process-on-host-a", "scope": "user:1000"}]}
+      ],
+      "datasets": [
+        {"dataset": "station-state", "path": "/home/operator/resident-client/test-hub-data", "access": "write", "ownership": "native"},
+        {"dataset": "station-agent-home", "path": "/home/operator/resident-client/agent-home", "access": "write", "ownership": "native"},
+        {"dataset": "station-continuity", "path": "/home/operator/resident-client", "access": "write", "ownership": "native"}
+      ],
+      "secrets": [
+        {"secret": "station-dashboard-token", "location": "station-state", "relative_path": "token"},
+        {"secret": "station-agent-auth", "location": "agent-home", "relative_path": "auth.json"},
+        {"secret": "station-env", "location": "env-file", "path": "/home/operator/.config/test-hub/env"},
+        {"secret": "station-caretaker-env", "location": "env-file", "path": "/home/operator/.config/test-hub/caretaker.env"},
+        {"secret": "station-caretaker-token", "location": "token-file", "path": "/home/operator/.config/test-hub/caretaker.token"},
+        {"secret": "test-carol-api-token", "location": "token-file", "path": "/home/operator/resident-client/test-hub-tokens/TEST_CAROL"},
+        {"secret": "test-dave-api-token", "location": "token-file", "path": "/home/operator/resident-client/test-hub-tokens/TEST_DAVE"},
+        {"secret": "station-test-bridge-token", "location": "token-file", "path": "/home/operator/.test-bridge/token"},
+        {"secret": "station-xauthority", "location": "xauthority", "path": "/home/operator/.Xauthority"}
+      ],
+      "endpoints": [
+        {"endpoint": "station-http", "address": "0.0.0.0", "host_port": 8770},
+        {"endpoint": "test-carol-test-bridge", "address": "127.0.0.1", "host_port": 25600},
+        {"endpoint": "test-dave-test-bridge", "address": "127.0.0.1", "host_port": 25610}
+      ]
+    }
+  ],
+  "activation_inputs": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "ActivationInput",
+    "application_id": "test-agent-cluster", "revision": 1,
+    "placement_ids": ["test-cluster-hub", "test-cluster-station"],
+    "runs": [
+      {"component": "test-alice", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "resume_thread": "PLACEHOLDER-owner-decides-fresh-or-resume", "model": "gpt-6.2-sol"},
+      {"component": "test-bob", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "resume_thread": "PLACEHOLDER-owner-decides-fresh-or-resume", "model": "gpt-6.2-sol"},
+      {"component": "test-carol", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "resume_thread": "PLACEHOLDER-owner-decides-fresh-or-resume", "model": "gpt-6.2-sol"},
+      {"component": "test-dave", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "resume_thread": "PLACEHOLDER-owner-decides-fresh-or-resume", "model": "gpt-6.2-sol"},
+      {"component": "hub-caretaker", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "model": "PLACEHOLDER-caretaker-model-from-caretaker-env"},
+      {"component": "station-caretaker", "deadline_epoch": "PLACEHOLDER-owner-approved-shared-deadline", "model": "PLACEHOLDER-caretaker-model-from-caretaker-env"}
+    ]
+  }]
+}

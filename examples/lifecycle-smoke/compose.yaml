@@ -1,0 +1,13 @@
+services:
+  probe:
+    image: 4a0915357175dbe21d4a8a05fd0438580f6dbb950011b8f3e6495551ab22408f
+    pull_policy: never
+    container_name: switchyard-compose-smoke
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["trap 'exit 0' TERM INT; sleep infinity & wait"]
+    stop_signal: SIGTERM
+    network_mode: none
+    read_only: true
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.05

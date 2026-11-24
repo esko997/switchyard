@@ -1,0 +1,50 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "sillytavern",
+  "revision": 1,
+  "role": "template",
+  "name": "SillyTavern",
+  "purpose": "SillyTavern chat/roleplay frontend on the LAN, CPU-only, talking to the Switchyard llama.cpp endpoints. HTTP basic auth configured in the operator-provided config dataset (config.yaml) before first start; the image refuses to listen without an access-control method.",
+  "components": [{
+    "id": "web",
+    "native": {
+      "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "sillytavern"},
+        "spec": {
+          "restartPolicy": "Always", "terminationGracePeriodSeconds": 5,
+          "containers": [{
+            "name": "web",
+            "image": "ghcr.io/sillytavern/sillytavern:1.19.1@sha256:660d1a23c70517fa6d5b9b76f4456ee11f002cd911007d838569e4a771a096bc",
+            "env": [{"name": "NODE_ENV", "value": "production"}],
+            "ports": [{"name": "http", "containerPort": 8000, "protocol": "TCP"}],
+            "volumeMounts": [
+              {"name": "config", "mountPath": "/home/node/app/config"},
+              {"name": "data", "mountPath": "/home/node/app/data"},
+              {"name": "extensions", "mountPath": "/home/node/app/public/scripts/extensions/third-party"},
+              {"name": "plugins", "mountPath": "/home/node/app/plugins"}
+            ],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+          }],
+          "volumes": [
+            {"name": "config", "hostPath": {"path": "dataset://config", "type": "Directory"}},
+            {"name": "data", "hostPath": {"path": "dataset://data", "type": "Directory"}},
+            {"name": "extensions", "hostPath": {"path": "dataset://extensions", "type": "Directory"}},
+            {"name": "plugins", "hostPath": {"path": "dataset://plugins", "type": "Directory"}}
+          ]
+        }
+      }
+    }
+  }],
+  "datasets": [
+    {"id": "config", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]},
+    {"id": "data", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]},
+    {"id": "extensions", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]},
+    {"id": "plugins", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]}
+  ],
+  "endpoints": [{"id": "http", "component": "web", "protocol": "tcp", "target_port": 8000, "consumers": ["LAN browsers; HTTP basic auth (plain HTTP, trusted LAN only)."]}],
+  "requires": [{"name": "podman"}, {"name": "systemd"}],
+  "health_checks": [{"id": "auth-enforced", "component": "web", "type": "http", "endpoint": "http", "path": "/", "status": 401, "timeout_seconds": 5, "ready_within_seconds": 120}],
+  "provenance": {"submitted_by": "operator", "source": "catalogs/templates/sillytavern.json"}
+}

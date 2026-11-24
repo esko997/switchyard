@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Workloads - Switchyard</title>
+  <link rel="preload" href="/big-shoulders.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/source-sans-3.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="masthead">
+    <div class="masthead-row">
+      <div class="brand"><span class="track-mark" aria-hidden="true"><i></i><i></i><i></i></span><h1>Switchyard</h1></div>
+      <nav class="tabs" role="tablist" aria-label="Views">
+        <button id="tab-workloads" role="tab" aria-controls="panel-workloads" aria-selected="true" tabindex="0" type="button">Workloads</button>
+        <button id="tab-lan-urls" role="tab" aria-controls="panel-lan-urls" aria-selected="false" tabindex="-1" type="button">LAN URLs</button>
+        <button id="tab-hosts" role="tab" aria-controls="panel-hosts" aria-selected="false" tabindex="-1" type="button">Hosts</button>
+        <button id="tab-agents" role="tab" aria-controls="panel-agents" aria-selected="false" tabindex="-1" type="button">Agents</button>
+        <button id="tab-playbooks" role="tab" aria-controls="panel-playbooks" aria-selected="false" tabindex="-1" type="button">Playbooks <span id="run-badge" class="tab-count" hidden></span></button>
+        <button id="tab-access" role="tab" aria-controls="panel-access" aria-selected="false" tabindex="-1" type="button" hidden>Access <span id="access-badge" class="tab-count tab-alert" hidden></span></button>
+        <button id="tab-migration" role="tab" aria-controls="panel-migration" aria-selected="false" tabindex="-1" type="button">Cold migration</button>
+        <button id="tab-receipts" role="tab" aria-controls="panel-receipts" aria-selected="false" tabindex="-1" type="button">Audit log <span id="operation-count" class="tab-count"></span></button>
+      </nav>
+      <div class="desk-status">
+        <p id="stream-status" class="signal" role="status"><span id="stream-lamp" class="lamp lamp-dark" aria-hidden="true"></span><span id="stream-text">Connecting</span></p>
+        <button id="monitor-chip" class="signal signal-button" type="button" title="Show the monitoring schedule under Hosts"><span id="monitor-lamp" class="lamp lamp-dark" aria-hidden="true"></span><span id="monitor-chip-text">Monitoring</span></button>
+        <p id="mode-label" class="signal">Monitoring only</p>
+        <button id="reload" class="button on-board" type="button" title="Re-read the server's cache. This does not contact any host.">Refresh</button>
+        <p id="session-label" class="signal" hidden></p>
+        <button id="session-action" class="button on-board" type="button" hidden>Sign in as operator</button>
+      </div>
+    </div>
+    <p id="fleet-status" class="desk-message" role="status"></p>
+    <p id="fleet-error" class="error-message" role="alert" hidden></p>
+  </header>
+  <main id="main" tabindex="-1">
+    <section id="sign-in" class="sign-in" aria-labelledby="sign-in-title" hidden>
+      <div class="side-panel sign-in-panel">
+        <h2 id="sign-in-title" tabindex="-1">Sign in</h2>
+        <p id="sign-in-note" class="section-note"></p>
+        <p id="sign-in-unset" class="row-attention" hidden>No operator password is set. Set it on the control host with <code>switchyard auth set-password</code>. It cannot be set from the browser.</p>
+        <form id="sign-in-form" class="operation-form" method="post">
+          <label for="sign-in-username">Username<input id="sign-in-username" name="username" maxlength="128" required autocomplete="username" autocapitalize="none" spellcheck="false"></label>
+          <label for="sign-in-password">Password<input id="sign-in-password" name="password" type="password" maxlength="1024" required autocomplete="current-password"></label>
+          <div class="shell-actions"><button id="sign-in-submit" class="button primary" type="submit">Sign in</button><button id="sign-in-cancel" class="button quiet" type="button">Cancel</button></div>
+        </form>
+        <p id="sign-in-error" class="error-message" role="alert" hidden></p>
+      </div>
+    </section>
+    <section id="panel-workloads" role="tabpanel" aria-labelledby="tab-workloads">
+      <div class="board">
+        <div class="board-inner">
+          <h2 class="visually-hidden">Workloads by host</h2>
+          <div id="yard" class="yard"><p class="empty-state">Loading cached data.</p></div>
+          <div class="board-foot">
+            <p id="yard-note" class="yard-note"></p>
+            <ul class="legend" aria-label="Legend">
+              <li><span class="lamp lamp-run" aria-hidden="true"></span>Running</li>
+              <li><span class="lamp lamp-idle" aria-hidden="true"></span>Idle</li>
+              <li><span class="lamp lamp-transit" aria-hidden="true"></span>Starting or stopping</li>
+              <li><span class="lamp lamp-halt" aria-hidden="true"></span>Stopped</li>
+              <li><span class="lamp lamp-fail" aria-hidden="true"></span>Failed</li>
+              <li><span class="lamp lamp-dark" aria-hidden="true"></span>Unknown</li>
+              <li><span class="legend-stale" aria-hidden="true"></span>Stale data</li>
+              <li><span class="flag-mark" aria-hidden="true"></span>Managed</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="desk split">
+        <div class="desk-main">
+          <div class="section-heading">
+            <h2>Workloads</h2>
+            <span id="workload-count" class="count"></span>
+            <button id="host-filter" class="filter-chip" type="button" title="Remove this host filter" hidden></button>
+            <label class="search-label" for="defined-search"><span class="visually-hidden">Filter workloads</span><input id="defined-search" type="search" placeholder="Filter by name, purpose or host" autocomplete="off"><kbd aria-hidden="true">/</kbd></label>
+            <label class="state-label" for="defined-state"><span class="visually-hidden">Show workloads by state</span><select id="defined-state"><option value="all">All states</option><option value="active">Running and idle</option><option value="stopped">Stopped</option><option value="attention">Needs attention</option></select></label>
+          </div>
+          <p class="section-note">Services and scheduled jobs defined in the catalog. A definition only describes a workload; control is configured separately and shows as Managed.</p>
+          <div class="roster-head" aria-hidden="true"><span>Workload</span><span>Host</span><span>Runtime</span><span>State</span><span>Last checked</span><span>Control</span></div>
+          <div id="workload-list" class="roster"><p class="empty-state">Loading cached data.</p></div>
+          <details id="discovery-section" class="support-details">
+            <summary><span>Discovered on hosts <span id="discovery-count" class="count"></span></span></summary>
+            <p class="section-note">Every systemd unit and container the collectors found. Nothing here is a workload until you define it.</p>
+            <div class="filters">
+              <label for="workload-search">Filter<input id="workload-search" type="search" placeholder="Name, unit, scope" autocomplete="off"></label>
+              <label for="lifecycle-filter">Lifecycle<select id="lifecycle-filter"><option value="active">Active and idle</option><option value="all">All lifecycles</option><option value="failed">Failed</option><option value="stopped">Stopped</option><option value="completed">Completed</option><option value="unknown">Unknown</option></select></label>
+              <label for="freshness-filter">Data age<select id="freshness-filter"><option value="all">Any age</option><option value="fresh">Fresh only</option><option value="stale">Stale only</option></select></label>
+              <label for="backend-filter">Runtime<select id="backend-filter"><option value="all">All runtimes</option></select></label>
+              <label for="scope-filter">Scope<select id="scope-filter"><option value="all">All scopes</option></select></label>
+              <label for="grouping-filter">Group by<select id="grouping-filter"><option value="native">Host and runtime</option><option value="application">Application (compose project or declared group)</option></select></label>
+            </div>
+            <div id="discovery-list"><p class="empty-state">Loading cached data.</p></div>
+            <details id="artifact-section" class="support-details nested"><summary><span>Images and packages <span id="artifact-count" class="count"></span></span></summary><p class="section-note">Container images and packages present on a host. Being installed does not mean anything is running. The filter, runtime, scope and data-age filters above apply.</p><div id="artifact-list"></div></details>
+          </details>
+        </div>
+        <aside class="side-desk" aria-label="Workload controls and definitions">
+          <section id="commons-handoff" class="side-panel control-only" aria-labelledby="commons-handoff-title" hidden>
+            <div class="side-head"><h3 id="commons-handoff-title" tabindex="-1">Commons Residents controls</h3><button id="close-commons-handoff" class="button quiet" type="button">Close</button></div>
+            <p class="section-note">Resident lifecycle belongs to Commons, not Switchyard. In Commons, choose an end time when no run exists; otherwise the current run's end time is inherited.</p>
+            <p id="commons-handoff-note" class="field-note">Paste your private Commons dashboard URL. It stays in this tab's session storage, never in Switchyard's server, fleet data or shared configuration. Anyone using this browser tab can use the saved link.</p>
+            <form id="commons-handoff-form" class="operation-form" autocomplete="off">
+              <label for="commons-handoff-url">Private dashboard URL<input id="commons-handoff-url" type="password" inputmode="url" maxlength="8192" required autocomplete="off" spellcheck="false" aria-describedby="commons-handoff-note"><span class="field-note">An absolute HTTP or HTTPS URL, including the dashboard's private path. No username, password or query string. Any fragment is replaced with Residents controls.</span></label>
+              <div class="shell-actions"><button class="button secondary" type="submit">Save for this tab</button><button id="forget-commons-handoff" class="button quiet" type="button">Forget saved link</button></div>
+            </form>
+            <p id="commons-handoff-status" class="status-line" role="status"></p>
+            <p id="commons-handoff-error" class="error-message" role="alert" hidden></p>
+          </section>
+          <section id="managed-operations" class="side-panel control-only" aria-labelledby="operations-title" hidden>
+            <div class="side-head"><h3 id="operations-title" tabindex="-1">Workload controls</h3><button id="close-operations" class="button quiet" type="button">Close controls</button></div>
+            <p class="section-note">Only workloads configured for control appear here. Running means the unit or container is up, not that the application is healthy.</p>
+            <ol id="interlock" class="interlock" aria-label="Execution gates">
+              <li id="gate-inspect"><span class="gate-name">Inspect</span><span class="gate-state"></span></li>
+              <li id="gate-plan"><span class="gate-name">Plan</span><span class="gate-state"></span></li>
+              <li id="gate-approve"><span class="gate-name">Approve</span><span class="gate-state"></span></li>
+              <li id="gate-execute"><span class="gate-name">Execute</span><span class="gate-state"></span></li>
+            </ol>
+            <form id="operation-form" class="operation-form">
+              <div class="operation-fields">
+                <label for="operation-workload">Workload<select id="operation-workload" required></select></label>
+                <label for="operation-action">Action<select id="operation-action" required></select></label>
+                <label id="operation-target-label" for="operation-target">Target host<select id="operation-target"><option value="">Use current placement</option></select></label>
+              </div>
+              <div class="shell-actions"><button id="inspect-workload" class="button secondary" type="button" hidden>Inspect workload</button><button id="plan-operation" class="button secondary" type="submit">Prepare plan</button></div>
+            </form>
+            <div id="operation-inspection" class="selection-context"></div>
+            <div id="operation-plan" class="selection-context"></div>
+            <div id="operation-approval" class="approval" hidden>
+              <label class="approval-label"><input id="approve-operation" type="checkbox">I approve executing this exact plan.</label>
+              <label for="operation-request-id">Request ID<input id="operation-request-id" class="machine" maxlength="128" autocomplete="off" spellcheck="false"><span class="field-note">Identifies this execution. Sending the same ID again returns the first result instead of running twice.</span></label>
+              <button id="execute-operation" class="button primary" type="button" disabled>Execute approved plan</button>
+            </div>
+            <p id="operation-status" class="status-line" role="status"></p>
+            <p id="operation-error" class="error-message" role="alert" hidden></p>
+          </section>
+          <section id="definition-editor" class="side-panel definition-editor" aria-labelledby="definition-editor-title" hidden>
+            <div class="side-head"><h3 id="definition-editor-title">Review workload definition</h3></div>
+            <p class="section-note">Definition only — no restart/deployment permission. The units and containers it names come from cached data. Health checks, dependencies and portability stay unknown until you supply them.</p>
+            <form id="definition-form" class="operation-form">
+              <div class="operation-fields">
+                <label for="definition-id">Workload ID<input id="definition-id" class="machine" maxlength="64" pattern="[a-z0-9][a-z0-9-]{0,63}" required autocomplete="off" spellcheck="false" aria-describedby="definition-id-note"><span id="definition-id-note" class="field-note">Lowercase letters, numbers and hyphens. Cannot change after saving.</span></label>
+                <label for="definition-name">Name<input id="definition-name" maxlength="4096" required autocomplete="off"></label>
+              </div>
+              <label for="definition-purpose">Purpose<textarea id="definition-purpose" rows="3" maxlength="8192" required></textarea></label>
+              <div id="definition-supporting-field"><label for="definition-supporting">Supporting units and containers<select id="definition-supporting" multiple size="4"></select></label><p class="field-note">Optional. Others on the same host that belong to this workload. Selecting one does not imply a dependency or grant control.</p></div>
+              <div class="shell-actions"><button id="review-definition" class="button secondary" type="submit">Review definition</button><button id="cancel-definition" class="button quiet" type="button">Close editor</button></div>
+            </form>
+            <div id="definition-review" class="selection-context"></div>
+            <button id="save-definition" class="button primary" type="button" disabled>Save reviewed definition</button>
+            <p id="definition-status" class="status-line" role="status"></p>
+            <p id="definition-error" class="error-message" role="alert" hidden></p>
+          </section>
+        </aside>
+      </div>
+    </section>
+    <section id="panel-lan-urls" role="tabpanel" aria-labelledby="tab-lan-urls" hidden>
+      <div class="desk split">
+        <div class="desk-main">
+          <div class="section-heading">
+            <h2 id="lan-urls-title" tabindex="-1">LAN URLs</h2>
+            <span id="lan-url-count" class="count"></span>
+            <label class="search-label" for="lan-url-search"><span class="visually-hidden">Filter LAN URLs and DNS records</span><input id="lan-url-search" type="search" placeholder="Filter by name, address, workload or host" autocomplete="off"><kbd aria-hidden="true">/</kbd></label>
+          </div>
+          <div class="section-heading lan-actions"><button id="publish-lan-url" class="button primary control-only" type="button" hidden>Publish LAN URL…</button><button id="add-lan-dns" class="button secondary control-only" type="button" hidden>Add DNS record…</button><button id="refresh-lan-urls" class="button secondary" type="button">Reload</button></div>
+          <p class="section-note">Publish a web endpoint through the LAN gateway, or add a DNS-only name for an IPv4 or IPv6 address. Every change is previewed first and runs only the exact plan you approve.</p>
+          <p id="lan-urls-viewer" class="row-attention" hidden></p>
+          <p id="lan-urls-status" class="status-line" role="status"></p>
+          <p id="lan-urls-error" class="error-message" role="alert" hidden></p>
+          <p id="lan-urls-availability" class="row-attention" hidden></p>
+          <div id="lan-pending"></div>
+          <div id="lan-url-list" class="lan-list"><p class="empty-state">Loading LAN URLs.</p></div>
+          <div class="section-heading lan-dns-heading"><h3>DNS-only records</h3><span id="lan-dns-count" class="count"></span></div>
+          <p class="section-note">A and AAAA records only, without a gateway route or web link. Host registry records are generated automatically and read-only here.</p>
+          <div id="lan-dns-list" class="lan-list"><p class="empty-state">Loading DNS records.</p></div>
+          <details id="lan-endpoint-section" class="support-details">
+            <summary><span>Endpoints without a LAN URL <span id="lan-endpoint-count" class="count"></span></span></summary>
+            <p class="section-note">Web endpoints that workloads declare and no name leads to yet.</p>
+            <div id="lan-endpoint-list" class="table-scroll"></div>
+          </details>
+        </div>
+        <aside class="side-desk" aria-label="LAN URL and DNS record editor">
+          <section id="lan-url-editor" class="side-panel host-editor" aria-labelledby="lan-url-editor-title" hidden>
+            <div class="side-head"><h3 id="lan-url-editor-title" tabindex="-1">Publish LAN URL</h3><button id="close-lan-url-editor" class="button quiet" type="button">Close editor</button></div>
+            <p id="lan-url-editor-note" class="section-note"></p>
+            <form id="lan-url-form" class="operation-form" novalidate>
+              <div id="lan-url-hostname-field" class="lan-field">
+                <label for="lan-url-hostname">Name<input id="lan-url-hostname" class="machine" maxlength="253" autocomplete="off" autocapitalize="none" spellcheck="false" inputmode="url" aria-describedby="lan-url-hostname-note lan-url-hostname-error"></label>
+                <span id="lan-url-hostname-note" class="field-note"></span>
+                <span id="lan-url-hostname-error" class="field-error" hidden></span>
+              </div>
+              <div id="lan-url-endpoint-field" class="lan-field">
+                <label for="lan-url-endpoint">Workload endpoint<select id="lan-url-endpoint" aria-describedby="lan-url-endpoint-note lan-url-endpoint-error"></select></label>
+                <span id="lan-url-endpoint-note" class="field-note">Where the name leads. Only endpoints that workloads declare are offered.</span>
+                <span id="lan-url-endpoint-error" class="field-error" hidden></span>
+              </div>
+              <div id="lan-dns-address-field" class="lan-field" hidden>
+                <label for="lan-dns-address">IP address<input id="lan-dns-address" class="machine" maxlength="45" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="lan-dns-address-note lan-dns-address-error"></label>
+                <span id="lan-dns-address-note" class="field-note">An IPv4 address (A record) or IPv6 address (AAAA record), without a port or brackets. The desk validates the address before planning.</span>
+                <span id="lan-dns-address-error" class="field-error" hidden></span>
+              </div>
+              <div class="shell-actions"><button id="plan-lan-url" class="button secondary" type="submit">Preview changes</button></div>
+            </form>
+            <p id="lan-url-status" class="status-line" role="status"></p>
+            <p id="lan-url-form-error" class="error-message" role="alert" hidden></p>
+            <div id="lan-url-plan" class="selection-context"></div>
+            <div id="lan-url-approval" class="approval" hidden>
+              <label class="approval-label"><input id="approve-lan-url" type="checkbox"><span id="approve-lan-url-text">I approve applying exactly these changes.</span></label>
+              <label for="lan-url-request-id">Request ID<input id="lan-url-request-id" class="machine" maxlength="128" autocomplete="off" spellcheck="false"><span class="field-note">Identifies this apply. Sending the same ID again returns the first result instead of running twice.</span></label>
+              <p id="lan-url-approval-note" class="row-attention" hidden></p>
+              <button id="apply-lan-url" class="button primary" type="button" disabled>Apply approved plan</button>
+            </div>
+            <div id="lan-url-result" class="selection-context"></div>
+          </section>
+        </aside>
+      </div>
+    </section>
+    <section id="panel-hosts" role="tabpanel" aria-labelledby="tab-hosts" hidden>
+      <div class="desk split">
+        <div class="desk-main">
+        <div class="section-heading">
+          <h2>Hosts</h2>
+          <span id="host-count" class="count"></span>
+          <label class="search-label" for="host-search"><span class="visually-hidden">Filter hosts</span><input id="host-search" type="search" placeholder="Filter by name, platform or ID" autocomplete="off"><kbd aria-hidden="true">/</kbd></label>
+        </div>
+        <p class="section-note">Latest cached readings for each host. Free capacity is a measurement, not a reservation.</p>
+        <details id="monitoring-details" class="support-details slim"><summary id="monitor-summary">Automatic monitoring</summary><p id="monitor-status" class="section-note"></p><div id="monitor-hosts" class="table-scroll"></div></details>
+        <div id="host-list" class="host-table"><p class="empty-state">Loading cached data.</p></div>
+        <details id="shell-panel" class="support-details control-only" hidden>
+          <summary>Remote shell</summary>
+          <p class="section-note">Runs your script with /bin/sh as the unprivileged SSH user on the chosen host. There is no command allowlist, no sudo and no password prompt. Anything you background can outlive the timeout.</p>
+          <form id="shell-form" class="operation-form">
+            <div class="operation-fields">
+              <label for="shell-host">Host<select id="shell-host" required></select></label>
+              <label for="shell-timeout">Timeout, seconds<input id="shell-timeout" type="number" min="1" max="240" value="30" required></label>
+              <label for="shell-request-id">Request ID<input id="shell-request-id" class="machine" maxlength="128" autocomplete="off" spellcheck="false" title="Sending the same ID again returns the first result instead of running twice."></label>
+            </div>
+            <label for="shell-extra-hosts">Other hosts this script touches<select id="shell-extra-hosts" multiple size="3" aria-describedby="shell-extra-note"></select></label>
+            <p id="shell-extra-note" class="field-note">Optional. Their device locks are held for the run too. Switchyard cannot work out destinations from the script text.</p>
+            <label for="shell-script">Script, 16 KiB at most<textarea id="shell-script" class="machine" rows="8" required autocomplete="off" autocapitalize="off" spellcheck="false"></textarea></label>
+            <div class="shell-actions"><button id="run-shell" class="button primary" type="submit">Run script</button><button id="shell-new-request" class="button quiet" type="button">New request ID</button></div>
+          </form>
+          <p class="field-note">The script and its output stay on this page and are not stored. Repeating a request ID returns the earlier audit-log entry without running again, and without the output.</p>
+          <p id="shell-status" class="status-line" role="status"></p>
+          <p id="shell-error" class="error-message" role="alert" hidden></p>
+          <pre id="shell-output" class="evidence" tabindex="0" aria-label="Shell output" hidden></pre>
+        </details>
+        <details id="fleet-keys-panel" class="support-details">
+          <summary><span>Fleet SSH keys <span id="fleet-keys-summary" class="count"></span></span></summary>
+          <p class="section-note">Each host keeps its own private key. Switchyard manages the public keys and pinned host keys that let enrolled hosts reach each other over SSH. That grants neither sudo nor permission to skip device locks. Everything below is cached.</p>
+          <div id="fleet-keys-status" class="table-scroll"></div>
+          <h3 class="sub-heading">Who can reach whom</h3>
+          <p class="section-note">Rows connect to columns. Verified means an SSH login was seen to succeed. From an enrolled host:</p>
+          <pre class="evidence command">ssh -F ~/.ssh/switchyard/config switchyard-&lt;host-id&gt;</pre>
+          <div id="fleet-keys-matrix" class="table-scroll" tabindex="0" aria-label="Fleet SSH connection matrix"></div>
+          <div id="fleet-keys-attention"></div>
+          <div class="control-only">
+          <h3 class="sub-heading">Change membership</h3>
+          <form id="fleet-keys-form" class="operation-form">
+            <div class="operation-fields">
+              <label for="fleet-key-hosts">Hosts<select id="fleet-key-hosts" multiple size="5" aria-describedby="fleet-key-selection-note"></select></label>
+              <label for="fleet-key-action">Action<select id="fleet-key-action"><option value="enroll">Enroll</option><option value="remove">Remove</option><option value="rotate">Rotate key</option><option value="reconcile">Reconcile pending peers</option></select></label>
+            </div>
+            <p id="fleet-key-selection-note" class="field-note">Inspecting is read-only and only happens when you ask. Reconcile with nothing selected uses the current members. Any change needs its own plan and approval.</p>
+            <div class="shell-actions"><button id="inspect-fleet-keys" class="button secondary" type="button">Inspect selected hosts</button><button id="plan-fleet-keys" class="button secondary" type="submit">Prepare key plan</button></div>
+          </form>
+          <div id="fleet-key-plan" class="selection-context"></div>
+          <div id="fleet-key-approval" class="approval" hidden>
+            <label class="approval-label"><input id="approve-fleet-keys" type="checkbox">I approve this exact key change, including partial and offline outcomes.</label>
+            <label for="fleet-key-request-id">Request ID<input id="fleet-key-request-id" class="machine" maxlength="128" autocomplete="off" spellcheck="false" title="Sending the same ID again returns the first result instead of running twice."></label>
+            <button id="execute-fleet-keys" class="button primary" type="button" disabled>Execute approved key plan</button>
+          </div>
+          </div>
+          <p id="fleet-key-status" class="status-line" role="status"></p>
+          <p id="fleet-key-error" class="error-message" role="alert" hidden></p>
+        </details>
+        <details class="support-details"><summary>Collectors and backends</summary><div id="backend-list" class="table-scroll"></div></details>
+        </div>
+        <aside class="side-desk" aria-label="Host editor">
+        <section id="host-editor" class="side-panel host-editor" aria-labelledby="host-editor-title" hidden>
+          <div class="side-head"><h3 id="host-editor-title">Edit host</h3><button id="close-host-editor" class="button quiet" type="button">Close editor</button></div>
+          <p class="section-note">Descriptions grant no control. Editing the connection keeps this host's pinned host key; the next successful check verifies the change.</p>
+          <form id="host-form" class="operation-form">
+            <div class="operation-fields">
+              <label for="host-name">Name<input id="host-name" maxlength="4096" required></label>
+              <label for="host-platform">Platform<input id="host-platform" maxlength="256" required></label>
+              <label for="host-architecture">Architecture<input id="host-architecture" maxlength="256" required></label>
+              <label for="host-capabilities">Capabilities, comma-separated<input id="host-capabilities" maxlength="8192"></label>
+            </div>
+            <label for="host-notes">Notes<textarea id="host-notes" rows="3" maxlength="8192"></textarea></label>
+            <fieldset id="host-connection" aria-describedby="host-connection-note">
+              <legend>Connection</legend>
+              <p id="host-connection-note" class="field-note"></p>
+              <div class="operation-fields">
+                <label for="host-account">Account<input id="host-account" maxlength="128" autocomplete="off" spellcheck="false"></label>
+                <label for="host-address">Address<input id="host-address" maxlength="256" autocomplete="off" spellcheck="false"></label>
+                <label for="host-port">Port<input id="host-port" type="number" min="1" max="65535"></label>
+                <label for="host-expected-hostname">Expected hostname<input id="host-expected-hostname" maxlength="256" autocomplete="off" spellcheck="false"></label>
+              </div>
+            </fieldset>
+            <div class="body-actions"><button id="review-host" class="button secondary" type="submit">Review changes</button><button id="save-host" class="button primary" type="button" disabled>Save changes</button></div>
+          </form>
+          <div id="host-review"></div>
+          <p id="host-editor-status" class="status-line" role="status"></p>
+          <p id="host-editor-error" class="error-message" role="alert" hidden></p>
+          <section aria-labelledby="host-key-title">
+            <h4 id="host-key-title">Pinned SSH identity</h4>
+            <div id="host-pins"></div>
+            <p id="host-key-note" class="field-note"></p>
+            <button id="scan-host-key" class="button secondary" type="button">Check host key</button>
+            <div id="host-key-scan"></div>
+            <div id="host-key-confirmation" class="approval" hidden>
+              <label class="approval-label" for="confirm-host-key"><input id="confirm-host-key" type="checkbox">I verified these fingerprints through a trusted independent source. Replace this host's pinned keys.</label>
+              <button id="pin-host-key" class="button primary" type="button" disabled>Pin this key</button>
+            </div>
+          </section>
+        </section>
+        </aside>
+      </div>
+    </section>
+    <section id="panel-agents" role="tabpanel" aria-labelledby="tab-agents" hidden>
+      <div class="desk split">
+        <div class="desk-main">
+        <div class="section-heading"><h2>Agents</h2><span id="agents-count" class="count"></span><button id="refresh-agents" class="button secondary" type="button">Reload agents and locks</button></div>
+        <p class="section-note">Who is working where, and which devices they hold. Agent details are cached Paseo metadata, never prompts or transcripts. Lock state is read locally and takes no lease.</p>
+        <p id="agents-status" class="status-line" role="status"></p>
+        <p id="agents-error" class="error-message" role="alert" hidden></p>
+        <div class="section-heading minor"><h3>Device locks</h3><span id="locks-count" class="count"></span></div>
+        <p class="section-note">The kernel lock is authoritative; ledger entries are supporting records. “Process started” is when the holder began, which can be earlier than when it took the lock.</p>
+        <div class="lock-head" aria-hidden="true"><span>Device</span><span>Host</span><span>State</span><span>Last ledger entry</span></div>
+        <div id="device-locks" class="lock-list"><p class="empty-state">Loading lock state.</p></div>
+        <div class="section-heading minor"><h3>Agents by host</h3></div>
+        <div id="agents-list"><p class="empty-state">Loading agents.</p></div>
+        </div>
+        <aside class="side-desk" aria-label="Paseo settings">
+        <section id="paseo-editor" class="side-panel host-editor" aria-labelledby="paseo-editor-title" hidden>
+          <div class="side-head"><h3 id="paseo-editor-title">Enable Paseo</h3><button id="close-paseo-editor" class="button quiet" type="button">Close editor</button></div>
+          <p class="section-note">Lets Switchyard read Paseo's agent list on this host. It does not start Paseo and does not contact the host now.</p>
+          <form id="paseo-form" class="operation-form">
+            <div class="operation-fields">
+              <label for="paseo-listen">Listen address<input id="paseo-listen" maxlength="256" value="127.0.0.1:6767" required></label>
+              <label for="paseo-cli">Paseo CLI<select id="paseo-cli"><option value="">HTTP-only (agents unknown)</option></select></label>
+            </div>
+            <div class="shell-actions"><button id="review-paseo" class="button secondary" type="submit">Review current configuration</button><button id="save-paseo" class="button primary" type="button" disabled>Enable Paseo</button></div>
+          </form>
+          <div id="paseo-review" class="selection-context"></div>
+          <p id="paseo-status" class="status-line" role="status"></p>
+          <p id="paseo-error" class="error-message" role="alert" hidden></p>
+        </section>
+        </aside>
+      </div>
+    </section>
+    <section id="panel-playbooks" role="tabpanel" aria-labelledby="tab-playbooks" hidden>
+      <div class="desk split">
+        <div class="desk-main">
+          <div class="section-heading"><h2 id="playbooks-title" tabindex="-1">Playbooks</h2><span id="playbook-count" class="count"></span><button id="add-playbook" class="button secondary" type="button" hidden>Add playbook…</button><button id="refresh-playbooks" class="button secondary" type="button">Reload</button></div>
+          <p class="section-note">Ansible playbooks registered on this desk. A plan runs the playbook in check mode under the host's lease and changes nothing on purpose; an apply runs exactly an approved plan. Reading this tab contacts no host.</p>
+          <p id="playbooks-viewer" class="row-attention" hidden></p>
+          <p id="playbooks-status" class="status-line" role="status"></p>
+          <p id="playbooks-error" class="error-message" role="alert" hidden></p>
+          <div id="playbook-list" class="playbook-list"><p class="empty-state">Loading playbooks.</p></div>
+          <div class="section-heading minor"><h3 id="runs-title" tabindex="-1">Runs</h3><span id="runs-count" class="count"></span></div>
+          <p class="section-note">Plans and applies, newest first, from this desk and the command line. A run continues if you close or reload the page.</p>
+          <div id="ansible-runs" class="run-list"><p class="empty-state">Loading runs.</p></div>
+        </div>
+        <aside class="side-desk" aria-label="Playbook editor and runs">
+          <section id="run-panel" class="side-panel run-panel" aria-labelledby="run-panel-title" hidden></section>
+          <section id="playbook-editor" class="side-panel host-editor" aria-labelledby="playbook-editor-title" hidden></section>
+        </aside>
+      </div>
+    </section>
+    <section id="panel-access" role="tabpanel" aria-labelledby="tab-access" hidden>
+      <div class="desk">
+        <div class="section-heading"><h2>Access</h2><span id="access-count" class="count"></span><button id="refresh-access" class="button secondary" type="button">Reload requests and keys</button></div>
+        <p class="section-note">A host or agent asks for access from its own terminal; approving here gives the key it generated the limits you choose. Switchyard stores only a hash of each key, so no key is ever shown here.</p>
+        <p id="access-viewer" class="row-attention" hidden></p>
+        <p id="access-status" class="status-line" role="status"></p>
+        <p id="access-error" class="error-message" role="alert" hidden></p>
+        <p id="access-target" class="row-attention" role="status" hidden></p>
+        <div class="section-heading minor"><h3 id="requests-title" tabindex="-1">Requests waiting</h3><span id="requests-count" class="count"></span></div>
+        <div id="access-requests" class="request-list"><p class="empty-state">Loading requests.</p></div>
+        <div id="access-recent"></div>
+        <div class="section-heading minor"><h3 id="keys-title" tabindex="-1">Keys</h3><span id="keys-count" class="count"></span></div>
+        <p id="keys-note" class="section-note">Each key works until it expires or is revoked. A revoked key is refused at once.</p>
+        <div id="access-keys" class="key-list"><p class="empty-state">Loading keys.</p></div>
+        <div class="section-heading minor"><h3>This desk's certificate</h3></div>
+        <div id="access-tls"></div>
+      </div>
+    </section>
+    <section id="panel-migration" role="tabpanel" aria-labelledby="tab-migration" hidden>
+      <div class="desk">
+        <div class="section-heading"><h2>Cold migration</h2><button id="open-workload-operations" class="button secondary control-only" type="button" hidden>Open migration controls</button></div>
+        <p class="section-note">The preflight checks whether a workload could move to another host, and changes nothing. Performing the move needs a managed workload, a plan and your approval.</p>
+        <div class="wizard">
+          <ol class="wizard-steps" aria-label="Preflight steps">
+            <li><button id="step-1" type="button" aria-current="step"><b>1</b><span>Workload</span></button></li>
+            <li><button id="step-2" type="button" disabled><b>2</b><span>Destination</span></button></li>
+            <li><button id="step-3" type="button" disabled><b>3</b><span>Review</span></button></li>
+          </ol>
+          <form id="proposal-form">
+            <section id="wizard-1" aria-labelledby="workload-step-title">
+              <h3 id="workload-step-title" tabindex="-1">Choose a workload</h3>
+              <label for="workload-select">Defined workload</label>
+              <select id="workload-select" name="workload_id" required disabled><option value="">Loading…</option></select>
+              <div id="workload-context" class="selection-context"><p class="empty-state">Choose a workload to see where it runs and whether it has a migration recipe.</p></div>
+              <button id="next-destination" class="button primary" type="button" disabled>Choose destination</button>
+            </section>
+            <section id="wizard-2" aria-labelledby="destination-step-title" hidden>
+              <h3 id="destination-step-title" tabindex="-1">Choose a destination</h3>
+              <label for="target-select">Destination host</label>
+              <select id="target-select" name="target_id" required disabled><option value="">Loading…</option></select>
+              <div id="target-context" class="selection-context"></div>
+              <div class="wizard-actions"><button class="button quiet" data-back="1" type="button">Back</button><button id="next-review" class="button primary" type="button" disabled>Review selection</button></div>
+            </section>
+            <section id="wizard-3" aria-labelledby="review-step-title" hidden>
+              <h3 id="review-step-title" tabindex="-1">Review and run the preflight</h3>
+              <div id="route-diagram" class="route"></div>
+              <div id="review-context" class="selection-context"></div>
+              <div class="wizard-actions"><button class="button quiet" data-back="2" type="button">Back</button><button id="create-proposal" class="button primary control-only" type="submit" disabled>Run preflight</button></div>
+              <p class="section-note view-only-note">The preflight can only be started from the control host. This read-only view cannot run it.</p>
+              <p id="proposal-status" class="status-line" role="status"></p>
+              <p id="proposal-error" class="error-message" role="alert" hidden></p>
+              <div id="proposal-result" class="proposal-result"><p class="empty-state">Run the preflight to see blockers, downtime and recovery.</p></div>
+            </section>
+          </form>
+        </div>
+      </div>
+    </section>
+    <section id="panel-receipts" role="tabpanel" aria-labelledby="tab-receipts" hidden>
+      <div class="desk">
+        <div class="section-heading"><h2>Audit log</h2><span id="receipt-summary" class="count"></span><label class="state-label end" for="receipt-filter"><span class="visually-hidden">Show entries by outcome</span><select id="receipt-filter"><option value="all">All outcomes</option><option value="unsettled">Failed or unconfirmed</option></select></label><button id="refresh-operations" class="button secondary" type="button">Reload</button></div>
+        <p class="section-note">Every operation requested through Switchyard and how it ended, including busy and uncertain outcomes. After a timeout or a lost response, check here before trying again.</p>
+        <p id="receipts-error" class="error-message" role="alert" hidden></p>
+        <div class="receipt-head" aria-hidden="true"><span>Outcome</span><span>Operation</span><span>Hosts</span><span>Started</span><span>ID</span></div>
+        <div id="operation-receipts" class="receipt-list"></div>
+      </div>
+    </section>
+    <footer><span>Switchyard</span><p id="footer-mode">Shows cached data.</p></footer>
+  </main>
+  <noscript><p class="noscript-message">JavaScript is required to load and show the data.</p></noscript>
+</body>
+</html>

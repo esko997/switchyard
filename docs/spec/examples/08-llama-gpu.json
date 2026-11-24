@@ -1,0 +1,600 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Bundle",
+  "applications": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Application",
+      "id": "llama-server-vulkan",
+      "revision": 1,
+      "name": "llama.cpp server (Vulkan GPU)",
+      "purpose": "One llama.cpp HTTP server (OpenAI-compatible /v1 API, /health, built-in chat page) for one GGUF model, run as a non-root container on the host's GPU through its Vulkan render node. The model directory comes from an existing read-only dataset (bind it with --dataset models=/abs/dir). One model uses most of the VRAM, so every instance on a host holds the same exclusive GPU resource: only one runs at a time (deploy switch-plan moves it). No authentication: anyone who can reach the claimed address and port can use the model.",
+      "role": "template",
+      "template_ref": null,
+      "components": [
+        {
+          "id": "server",
+          "native": {
+            "kind": "kube",
+            "subset": "podman-pod-v2",
+            "mode": "quadlet-kube",
+            "manifest": {
+              "apiVersion": "v1",
+              "kind": "Pod",
+              "metadata": {
+                "name": "llama-server",
+                "labels": {
+                  "app": "llama-server-vulkan"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "name": "server",
+                    "image": "ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:PLACEHOLDER-resolve-at-plan",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [],
+                    "args": [
+                      "--host",
+                      "0.0.0.0",
+                      "--port",
+                      "8080",
+                      "--model",
+                      "/models/{{model-file}}",
+                      "--ctx-size",
+                      "{{context-size}}",
+                      "{{extra-args}}"
+                    ],
+                    "workingDir": null,
+                    "env": [],
+                    "ports": [
+                      {
+                        "name": "http",
+                        "containerPort": 8080,
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "volumeMounts": [
+                      {
+                        "name": "models",
+                        "mountPath": "/models",
+                        "readOnly": true,
+                        "subPath": "{{model-dir}}"
+                      }
+                    ],
+                    "resources": null,
+                    "securityContext": {
+                      "runAsUser": 1000,
+                      "runAsGroup": 1000,
+                      "readOnlyRootFilesystem": null,
+                      "allowPrivilegeEscalation": false,
+                      "capabilities": {
+                        "add": [],
+                        "drop": [
+                          "ALL"
+                        ]
+                      },
+                      "privileged": null
+                    },
+                    "livenessProbe": null
+                  }
+                ],
+                "volumes": [
+                  {
+                    "name": "models",
+                    "hostPath": {
+                      "path": "dataset://models",
+                      "type": "Directory"
+                    },
+                    "emptyDir": null,
+                    "configMap": null
+                  }
+                ],
+                "restartPolicy": "Always",
+                "terminationGracePeriodSeconds": 10,
+                "securityContext": null,
+                "hostNetwork": false
+              }
+            },
+            "compatibility_gates": [],
+            "reviews": []
+          },
+          "sources": [],
+          "depends_on": [],
+          "gates": []
+        }
+      ],
+      "datasets": [
+        {
+          "id": "models",
+          "snapshot": "files-quiesced",
+          "verify": "sha256-manifest",
+          "writers": [
+            "server"
+          ],
+          "readers": [
+            "server"
+          ],
+          "external_actors": [],
+          "include": [
+            "**/*.gguf"
+          ],
+          "exclude": [],
+          "health_files": []
+        }
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "id": "http",
+          "component": "server",
+          "protocol": "tcp",
+          "target_port": 8080,
+          "consumers": [
+            "No authentication: every host that can reach this address and port can send prompts, use /v1 and the chat page (example policy; restrict network reachability)",
+            "OpenAI-compatible clients at http://ADDRESS:PORT/v1",
+            "Browsers (the chat page needs gzip; curl needs --compressed)"
+          ]
+        }
+      ],
+      "requires": [
+        {
+          "name": "podman",
+          "components": [],
+          "capacity": null,
+          "probe_ref": null
+        },
+        {
+          "name": "systemd",
+          "components": [],
+          "capacity": null,
+          "probe_ref": null
+        },
+        {
+          "name": "gpu",
+          "components": [
+            "server"
+          ],
+          "capacity": {
+            "memory_mib": null,
+            "disk_gib": null,
+            "gpu": "Vulkan-capable GPU render node; verify VRAM capacity for the chosen model and context"
+          },
+          "probe_ref": null
+        }
+      ],
+      "external_dependencies": [],
+      "health_checks": [
+        {
+          "id": "health",
+          "component": "server",
+          "timeout_seconds": 5,
+          "type": "http",
+          "endpoint": "http",
+          "scheme": "http",
+          "path": "/health",
+          "status": 200,
+          "redirects": false,
+          "body_sha256": null,
+          "predicate_ref": null,
+          "credential_ref": null,
+          "ready_within_seconds": 120
+        }
+      ],
+      "consistency_groups": [],
+      "recipes": [],
+      "identities": [
+        {
+          "id": "gpu",
+          "kind": "gpu",
+          "name": "/dev/dri/renderD128",
+          "holders": [
+            "server"
+          ],
+          "description": "One model needs most of the GPU's memory: at most one instance per host holds this GPU (start, unfence and plans refuse while another holds it; deploy switch-plan moves it).",
+          "scope": "host"
+        }
+      ],
+      "parameters": [
+        {
+          "id": "model-dir",
+          "description": "Directory of the model inside the models dataset, for example unsloth/Qwen3.8-27B-GGUF; only this directory is mounted, read-only, at /models.",
+          "format": "relative-path",
+          "default": null,
+          "value": null
+        },
+        {
+          "id": "model-file",
+          "description": "GGUF file inside model-dir, for example Qwen3.8-27B-UD-Q4_K_XL.gguf (the first part of a split model).",
+          "format": "relative-path",
+          "default": null,
+          "value": null
+        },
+        {
+          "id": "context-size",
+          "description": "Context window in tokens (--ctx-size).",
+          "format": "integer",
+          "default": "65536",
+          "value": null
+        },
+        {
+          "id": "extra-args",
+          "description": "Further llama-server arguments, space-separated tokens without quotes (GPU layers, flash attention, KV cache types, parallel slots, speculative decoding).",
+          "format": "argument-list",
+          "default": "-ngl all --fit off -fa on -ctk q8_0 -ctv q8_0 -np 1",
+          "value": null
+        }
+      ],
+      "config_files": [],
+      "devices": [
+        {
+          "id": "render",
+          "component": "server",
+          "container": "server",
+          "host_path": "/dev/dri/renderD128",
+          "container_path": null,
+          "access": "read-write",
+          "description": "The GPU's DRM render node: Vulkan compute and GPU memory, no display output (no card node)."
+        }
+      ],
+      "notes": null,
+      "provenance": {
+        "submitted_by": "switchyard-operator",
+        "source": "catalogs/templates/llama-server-vulkan.json",
+        "evidence": [
+          "Synthetic GPU example: grant only the render node required by the selected runtime and verify permissions before deployment",
+          "The image runs /app/llama-server as its entrypoint; the tag's digest is resolved at plan time and pinned in the instance"
+        ]
+      }
+    },
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Application",
+      "id": "llm-a",
+      "revision": 1,
+      "name": "llama.cpp server (Vulkan GPU)",
+      "purpose": "One llama.cpp HTTP server (OpenAI-compatible /v1 API, /health, built-in chat page) for one GGUF model, run as a non-root container on the host's GPU through its Vulkan render node. The model directory comes from an existing read-only dataset (bind it with --dataset models=/abs/dir). One model uses most of the VRAM, so every instance on a host holds the same exclusive GPU resource: only one runs at a time (deploy switch-plan moves it). No authentication: anyone who can reach the claimed address and port can use the model.",
+      "role": "instance",
+      "template_ref": {
+        "id": "llama-server-vulkan",
+        "revision": 1
+      },
+      "components": [
+        {
+          "id": "server",
+          "native": {
+            "kind": "kube",
+            "subset": "podman-pod-v2",
+            "mode": "quadlet-kube",
+            "manifest": {
+              "apiVersion": "v1",
+              "kind": "Pod",
+              "metadata": {
+                "name": "switchyard-llm-a-server",
+                "labels": {
+                  "app": "llama-server-vulkan"
+                }
+              },
+              "spec": {
+                "containers": [
+                  {
+                    "name": "server",
+                    "image": "ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:PLACEHOLDER-pinned-at-plan",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": [],
+                    "args": [
+                      "--host",
+                      "0.0.0.0",
+                      "--port",
+                      "8080",
+                      "--model",
+                      "/models/{{model-file}}",
+                      "--ctx-size",
+                      "{{context-size}}",
+                      "{{extra-args}}"
+                    ],
+                    "workingDir": null,
+                    "env": [],
+                    "ports": [
+                      {
+                        "name": "http",
+                        "containerPort": 8080,
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "volumeMounts": [
+                      {
+                        "name": "models",
+                        "mountPath": "/models",
+                        "readOnly": true,
+                        "subPath": "{{model-dir}}"
+                      }
+                    ],
+                    "resources": null,
+                    "securityContext": {
+                      "runAsUser": 1000,
+                      "runAsGroup": 1000,
+                      "readOnlyRootFilesystem": null,
+                      "allowPrivilegeEscalation": false,
+                      "capabilities": {
+                        "add": [],
+                        "drop": [
+                          "ALL"
+                        ]
+                      },
+                      "privileged": null
+                    },
+                    "livenessProbe": null
+                  }
+                ],
+                "volumes": [
+                  {
+                    "name": "models",
+                    "hostPath": {
+                      "path": "dataset://models",
+                      "type": "Directory"
+                    },
+                    "emptyDir": null,
+                    "configMap": null
+                  }
+                ],
+                "restartPolicy": "Always",
+                "terminationGracePeriodSeconds": 10,
+                "securityContext": null,
+                "hostNetwork": false
+              }
+            },
+            "compatibility_gates": [],
+            "reviews": []
+          },
+          "sources": [],
+          "depends_on": [],
+          "gates": [
+            {
+              "id": "generation-gate",
+              "kind": "exec-start-pre",
+              "target": "switchyard-llm-a-server.service",
+              "covers": "Every systemd start path of the generated Quadlet unit: Switchyard start, manual systemctl --user start, default.target at boot and Restart=.",
+              "misses": "podman kube play run by hand on the rendered YAML; a filesystem rollback of the token file."
+            }
+          ]
+        }
+      ],
+      "datasets": [
+        {
+          "id": "models",
+          "snapshot": "files-quiesced",
+          "verify": "sha256-manifest",
+          "writers": [
+            "server"
+          ],
+          "readers": [
+            "server"
+          ],
+          "external_actors": [],
+          "include": [
+            "**/*.gguf"
+          ],
+          "exclude": [],
+          "health_files": []
+        }
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "id": "http",
+          "component": "server",
+          "protocol": "tcp",
+          "target_port": 8080,
+          "consumers": [
+            "No authentication: every host that can reach this address and port can send prompts, use /v1 and the chat page (example policy; restrict network reachability)",
+            "OpenAI-compatible clients at http://ADDRESS:PORT/v1",
+            "Browsers (the chat page needs gzip; curl needs --compressed)"
+          ]
+        }
+      ],
+      "requires": [
+        {
+          "name": "podman",
+          "components": [],
+          "capacity": null,
+          "probe_ref": null
+        },
+        {
+          "name": "systemd",
+          "components": [],
+          "capacity": null,
+          "probe_ref": null
+        },
+        {
+          "name": "gpu",
+          "components": [
+            "server"
+          ],
+          "capacity": {
+            "memory_mib": null,
+            "disk_gib": null,
+            "gpu": "Vulkan-capable GPU render node; verify VRAM capacity for the chosen model and context"
+          },
+          "probe_ref": null
+        }
+      ],
+      "external_dependencies": [],
+      "health_checks": [
+        {
+          "id": "health",
+          "component": "server",
+          "timeout_seconds": 5,
+          "type": "http",
+          "endpoint": "http",
+          "scheme": "http",
+          "path": "/health",
+          "status": 200,
+          "redirects": false,
+          "body_sha256": null,
+          "predicate_ref": null,
+          "credential_ref": null,
+          "ready_within_seconds": 120
+        }
+      ],
+      "consistency_groups": [],
+      "recipes": [],
+      "identities": [
+        {
+          "id": "gpu",
+          "kind": "gpu",
+          "name": "/dev/dri/renderD128",
+          "holders": [
+            "server"
+          ],
+          "description": "One model needs most of the GPU's memory: at most one instance per host holds this GPU (start, unfence and plans refuse while another holds it; deploy switch-plan moves it).",
+          "scope": "host"
+        }
+      ],
+      "parameters": [
+        {
+          "id": "model-dir",
+          "description": "Directory of the model inside the models dataset, for example unsloth/Qwen3.8-27B-GGUF; only this directory is mounted, read-only, at /models.",
+          "format": "relative-path",
+          "default": null,
+          "value": "unsloth/Qwen3.8-27B-GGUF"
+        },
+        {
+          "id": "model-file",
+          "description": "GGUF file inside model-dir, for example Qwen3.8-27B-UD-Q4_K_XL.gguf (the first part of a split model).",
+          "format": "relative-path",
+          "default": null,
+          "value": "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        },
+        {
+          "id": "context-size",
+          "description": "Context window in tokens (--ctx-size).",
+          "format": "integer",
+          "default": "65536",
+          "value": null
+        },
+        {
+          "id": "extra-args",
+          "description": "Further llama-server arguments, space-separated tokens without quotes (GPU layers, flash attention, KV cache types, parallel slots, speculative decoding).",
+          "format": "argument-list",
+          "default": "-ngl all --fit off -fa on -ctk q8_0 -ctv q8_0 -np 1",
+          "value": null
+        }
+      ],
+      "config_files": [],
+      "devices": [
+        {
+          "id": "render",
+          "component": "server",
+          "container": "server",
+          "host_path": "/dev/dri/renderD128",
+          "container_path": null,
+          "access": "read-write",
+          "description": "The GPU's DRM render node: Vulkan compute and GPU memory, no display output (no card node)."
+        }
+      ],
+      "notes": null,
+      "provenance": {
+        "submitted_by": "switchyard-deploy",
+        "source": "template llama-server-vulkan revision 1",
+        "evidence": [
+          "review example: digest and ownership ID are placeholders"
+        ]
+      }
+    }
+  ],
+  "placements": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Placement",
+      "id": "llm-a-g1",
+      "application_id": "llm-a",
+      "revision": 1,
+      "host_id": "host-e",
+      "generation": 1,
+      "state": "active",
+      "ownership": "deployed",
+      "ownership_id": "PLACEHOLDER-created-resource-ownership-id",
+      "components": [
+        {
+          "component": "server",
+          "native_identities": [
+            {
+              "native_id": "switchyard-llm-a-server.service",
+              "scope": "user:1000",
+              "name": null,
+              "backend": null,
+              "role": null
+            },
+            {
+              "native_id": "pod/switchyard-llm-a-server",
+              "scope": "user:1000",
+              "name": null,
+              "backend": null,
+              "role": null
+            }
+          ],
+          "source_paths": {},
+          "project_directory": null,
+          "launcher_path": null,
+          "ungated_reason": null
+        }
+      ],
+      "datasets": [
+        {
+          "dataset": "models",
+          "path": "/srv/test-models",
+          "access": "write",
+          "ownership": "unknown",
+          "ownership_check": "operator-provided directory, mounted read-only through its model-dir sub-path"
+        }
+      ],
+      "secrets": [],
+      "endpoints": [
+        {
+          "endpoint": "http",
+          "address": "192.168.50.104",
+          "host_port": 18190
+        }
+      ],
+      "reviewed_paths": [],
+      "fence": {
+        "journal_generation": 1,
+        "host_generation": 1,
+        "tokens": [
+          {
+            "application_id": "llm-a",
+            "component": "server",
+            "generation": 1,
+            "issued_at": "PLACEHOLDER-issued-at",
+            "token_path": "/home/operator/.local/share/switchyard/apps/llm-a/server.token",
+            "gates": [
+              {
+                "gate": "generation-gate",
+                "evidence": "PLACEHOLDER-unit-and-generated-fragment-evidence"
+              }
+            ],
+            "state": "valid",
+            "revoked_at": null
+          }
+        ],
+        "masked": false,
+        "activators": [
+          "systemctl --user start switchyard-llm-a-server.service",
+          "default.target at user-manager start (WantedBy; boot needs linger)",
+          "unit restart (Restart= policy of the generated unit)"
+        ],
+        "previous_policy": "none: generated by Switchyard for this generation",
+        "stopped_native_ids": [],
+        "evidence": [
+          "PLACEHOLDER-start-health-and-device-evidence"
+        ],
+        "verified_at": "PLACEHOLDER-verified-at",
+        "release_requires": "explicit-recovery-other-generation-inactive",
+        "takeover": null
+      },
+      "migration_recipe": null
+    }
+  ],
+  "activation_inputs": []
+}

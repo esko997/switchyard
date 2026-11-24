@@ -1,0 +1,66 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Bundle",
+  "applications": [{
+    "apiVersion": "switchyard/v1alpha3",
+    "kind": "Application",
+    "id": "test-game-server",
+    "revision": 1,
+    "name": "TEST game server",
+    "purpose": "Adopt the complete existing Compose project; service keys and mounts need inspection.",
+    "components": [{
+      "id": "minecraft-project",
+      "native": {
+        "kind": "compose",
+        "provider": "podman-compose",
+        "project_name": "test_game_server",
+        "files": ["compose-file"],
+        "services": ["PLACEHOLDER-server-service", "PLACEHOLDER-backup-service", "PLACEHOLDER-chunky-service"]
+      }
+    }],
+    "datasets": [{
+      "id": "world",
+      "snapshot": "files-quiesced",
+      "verify": "sha256-manifest",
+      "writers": ["minecraft-project"],
+      "readers": ["minecraft-project"]
+    }],
+    "requires": [{"name": "linux"}, {"name": "podman"}, {"name": "podman-compose"}],
+    "health_checks": [{
+      "id": "world-verified", "component": "minecraft-project", "type": "predicate",
+      "predicate_ref": "PLACEHOLDER-world-backup-and-application-acceptance"
+    }, {
+      "id": "project-quiesced", "component": "minecraft-project", "type": "predicate",
+      "predicate_ref": "PLACEHOLDER-all-server-backup-and-chunky-writers-stopped"
+    }],
+    "recipes": [{
+      "id": "cold-copy", "revision": 1,
+      "steps": [
+        {"id": "fence-project", "action": "fence", "target": {"kind": "component", "id": "minecraft-project"}, "idempotent": false, "checkpoint": "downtime"},
+        {"id": "stop-project", "action": "stop", "target": {"kind": "component", "id": "minecraft-project"}, "idempotent": false},
+        {"id": "quiesce-project", "action": "quiesce-check", "target": {"kind": "dataset", "id": "world"}, "idempotent": true, "checks": ["project-quiesced"]},
+        {"id": "snapshot-world", "action": "snapshot", "target": {"kind": "dataset", "id": "world"}, "idempotent": false, "checks": ["world-verified"]},
+        {"id": "copy-world", "action": "transfer", "target": {"kind": "dataset", "id": "world"}, "idempotent": true, "checks": ["world-verified"]},
+        {"id": "writer-boundary", "action": "activate-gate", "target": {"kind": "component", "id": "minecraft-project"}, "idempotent": false, "checkpoint": "writer-switch"},
+        {"id": "start-project", "action": "start", "target": {"kind": "component", "id": "minecraft-project"}, "idempotent": false, "checks": ["world-verified"]}
+      ]
+    }],
+    "provenance": {
+      "submitted_by": "operator-review",
+      "source": "catalogs/home-lab.json",
+      "evidence": ["Known container names are observation evidence, not spec bindings; dataset, secret and endpoint inventory remains incomplete."]
+    }
+  }],
+  "placements": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "Placement",
+    "id": "test-game-host-b", "application_id": "test-game-server", "revision": 1,
+    "host_id": "host-b", "generation": 1, "state": "declared", "ownership": "adopted",
+    "components": [{
+      "component": "minecraft-project",
+      "native_identities": [{"native_id": "test_game_server", "scope": "user:1000"}],
+      "project_directory": "/home/operator/test-servers/test_game_server",
+      "source_paths": {"compose-file": "PLACEHOLDER-canonical-compose-file"}
+    }],
+    "datasets": [{"dataset": "world", "path": "PLACEHOLDER-world-mount", "access": "write", "ownership": "unknown"}]
+  }]
+}

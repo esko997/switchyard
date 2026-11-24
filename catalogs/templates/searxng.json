@@ -1,0 +1,68 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "searxng",
+  "revision": 1,
+  "role": "template",
+  "name": "SearXNG (LAN search)",
+  "purpose": "Rootless SearXNG for trusted LAN clients. Serves the browser UI and the JSON search API from one CPU-only Pod, with no account, GPU, or Valkey dependency. Not intended for public exposure.",
+  "config_files": [{
+    "id": "settings",
+    "component": "web",
+    "path": "settings.yml",
+    "on_change": "restart",
+    "content": "use_default_settings: true\nserver:\n  limiter: false\n  public_instance: false\n  image_proxy: false\nsearch:\n  formats: [html, json]\n  autocomplete: ''\n"
+  }],
+  "components": [{
+    "id": "web",
+    "native": {
+      "kind": "kube",
+      "subset": "podman-pod-v2",
+      "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "searxng", "labels": {"app": "searxng"}},
+        "spec": {
+          "restartPolicy": "Always",
+          "terminationGracePeriodSeconds": 5,
+          "containers": [{
+            "name": "searxng",
+            "image": "ghcr.io/searxng/searxng:2026.11.23-a7163d091@sha256:a7fc607aa6723f5a8982105bcc5ffba4d1b9fc7c6922a31a88d6e4cba49ef12a",
+            "command": ["/bin/sh", "-ec"],
+            "args": ["SEARXNG_SECRET=$(head -c 32 /dev/urandom | base64); test ${#SEARXNG_SECRET} -eq 44; export SEARXNG_SECRET; exec /usr/local/searxng/.venv/bin/granian searx.webapp:app"],
+            "env": [
+              {"name": "GRANIAN_HOST", "value": "0.0.0.0"},
+              {"name": "GRANIAN_WORKERS", "value": "1"},
+              {"name": "GRANIAN_BLOCKING_THREADS", "value": "2"},
+              {"name": "GRANIAN_WORKERS_KILL_TIMEOUT", "value": "3s"}
+            ],
+            "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}],
+            "volumeMounts": [{"name": "config", "mountPath": "/etc/searxng", "readOnly": true}],
+            "securityContext": {
+              "runAsUser": 977,
+              "runAsGroup": 977,
+              "allowPrivilegeEscalation": false,
+              "capabilities": {"drop": ["ALL"]}
+            }
+          }],
+          "volumes": [{"name": "config", "hostPath": {"path": "config://web", "type": "Directory"}}]
+        }
+      }
+    }
+  }],
+  "endpoints": [{
+    "id": "http", "component": "web", "protocol": "tcp", "target_port": 8080,
+    "consumers": ["LAN browser", "Open WebUI SearXNG provider (/search?format=json)"]
+  }],
+  "requires": [{"name": "podman"}, {"name": "systemd"}],
+  "health_checks": [{
+    "id": "homepage", "component": "web", "type": "http", "endpoint": "http",
+    "path": "/", "status": 200, "redirects": false, "timeout_seconds": 5, "ready_within_seconds": 30
+  }],
+  "provenance": {
+    "submitted_by": "switchyard-operator",
+    "source": "catalogs/templates/searxng.json",
+    "evidence": ["Official GHCR image pinned by release manifest digest; uses SearXNG's default engines.", "JSON is explicitly enabled. The signing key is generated at container start and never stored in the template or journal."]
+  }
+}

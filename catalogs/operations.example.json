@@ -1,0 +1,10 @@
+{
+  "schema_version": 2,
+  "shell_hosts": ["source"],
+  "fleet_key_hosts": ["source", "destination"],
+  "deploy_hosts": ["destination"],
+  "token_hosts": [],
+  "workloads": {
+    "notes-sync": {"actions": ["start", "stop", "restart"], "hosts": ["source"]}
+  }
+}

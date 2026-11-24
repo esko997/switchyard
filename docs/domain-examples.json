@@ -1,0 +1,48 @@
+{
+  "status": "fictional-design-example-not-runtime-api",
+  "provenance": "Authored synthetic declarations, not an export, audit or claim of observed hardware or service state.",
+  "host": {
+    "id": "host-a",
+    "name": "Example workstation",
+    "kind": "workstation",
+    "management": "declared",
+    "platform": {"os_family": "linux", "distribution": null, "architecture": "x86_64"},
+    "coverage": [
+      {"scope": "systemd:user:1000", "status": "not-attempted", "observed_at": null},
+      {"scope": "podman:root", "status": "not-attempted", "reason": "No privileged enumeration is implied"}
+    ],
+    "placement_policy": {"automatic_placement": false, "budget": null},
+    "resources": [
+      {"id": "cpu-package-0", "kind": "cpu", "inventory": {"physical_cores": null, "logical_cpus": null}, "readings": []},
+      {"id": "memory-system", "kind": "memory", "accounting_pool": "system-ram", "readings": []},
+      {"id": "filesystem-data", "kind": "filesystem", "accounting_pool": "data-pool", "backed_by": [], "readings": []}
+    ]
+  },
+  "backend_resources": [
+    {
+      "id": "example-sync-service", "host_id": "host-a", "backend": "systemd", "scope": "user:1000",
+      "native_id": "notes-sync.service", "lifecycle": "unknown", "health": "unknown", "observed_at": null,
+      "extensions": {"systemd.v1": {"triggered_by": ["notes-sync.timer"]}}
+    },
+    {
+      "id": "example-sync-timer", "host_id": "host-a", "backend": "systemd", "scope": "user:1000",
+      "native_id": "notes-sync.timer", "lifecycle": "unknown", "health": "unknown", "observed_at": null,
+      "extensions": {}
+    }
+  ],
+  "workload_candidates": [
+    {
+      "id": "candidate-notes-sync", "name": "Notes sync", "kind": "scheduled-job", "management": "declared",
+      "members": ["example-sync-service", "example-sync-timer"],
+      "classification_basis": "Fictional service/timer relationship; requires actual inspection before adoption",
+      "migration": {"status": "unknown", "reason": "Data ownership, activation and recovery are not established"}
+    }
+  ],
+  "workload_definitions": [],
+  "deployments": [],
+  "notes": [
+    "These proposed shapes are not validated runtime snapshots and cannot be imported as observed facts.",
+    "Missing metrics and observation timestamps remain unknown; declarations never refresh evidence.",
+    "Shared capacity is represented once and referenced, not added per mount or component."
+  ]
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Switchyard disposable systemd lifecycle probe
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/sleep infinity
+Restart=no
+NoNewPrivileges=yes
+MemoryMax=32M
+CPUQuota=5%
+TimeoutStopSec=10

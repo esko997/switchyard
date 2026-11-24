@@ -1,0 +1,110 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "llama-server-vulkan",
+  "revision": 2,
+  "role": "template",
+  "name": "llama.cpp server (Vulkan GPU)",
+  "purpose": "One llama.cpp HTTP server (OpenAI-compatible /v1 API, /health, built-in chat page) for one GGUF model, run as a non-root container on the host's GPU through its Vulkan render node. The model directory comes from an existing read-only dataset (bind it with --dataset models=/abs/dir). One model uses most of the VRAM, so every instance on a host holds the same exclusive GPU resource: only one runs at a time (deploy switch-plan moves it). No authentication: anyone who can reach the claimed address and port can use the model.",
+  "parameters": [
+    {"id": "model-dir", "format": "relative-path", "description": "Directory of the model inside the models dataset, for example unsloth/Qwen3.8-27B-GGUF; only this directory is mounted, read-only, at /models."},
+    {"id": "model-file", "format": "relative-path", "description": "GGUF file inside model-dir, for example Qwen3.8-27B-UD-Q4_K_XL.gguf (the first part of a split model)."},
+    {"id": "context-size", "format": "integer", "default": "65536", "description": "Context window in tokens (--ctx-size)."},
+    {"id": "extra-args", "format": "argument-list", "default": "-ngl all --fit off -fa on -ctk q8_0 -ctv q8_0 -np 1", "description": "Further llama-server arguments, space-separated tokens without quotes (GPU layers, flash attention, KV cache types, parallel slots, speculative decoding)."}
+  ],
+  "components": [{
+    "id": "server",
+    "native": {
+      "kind": "kube",
+      "subset": "podman-pod-v2",
+      "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "llama-server", "labels": {"app": "llama-server-vulkan"}},
+        "spec": {
+          "restartPolicy": "Always",
+          "terminationGracePeriodSeconds": 10,
+          "containers": [{
+            "name": "server",
+            "image": "ghcr.io/ggml-org/llama.cpp:server-vulkan@sha256:PLACEHOLDER-resolve-at-plan",
+            "args": ["--host", "0.0.0.0", "--port", "8080", "--model", "/models/{{model-file}}", "--ctx-size", "{{context-size}}", "{{extra-args}}"],
+            "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}],
+            "volumeMounts": [{"name": "models", "mountPath": "/models", "readOnly": true, "subPath": "{{model-dir}}"}],
+            "securityContext": {
+              "runAsUser": 1000,
+              "runAsGroup": 1000,
+              "allowPrivilegeEscalation": false,
+              "capabilities": {"drop": ["ALL"]}
+            }
+          }],
+          "volumes": [{"name": "models", "hostPath": {"path": "dataset://models", "type": "Directory"}}]
+        }
+      }
+    }
+  }],
+  "datasets": [{
+    "id": "models",
+    "snapshot": "files-quiesced",
+    "verify": "sha256-manifest",
+    "writers": ["server"],
+    "readers": ["server"],
+    "include": ["**/*.gguf"]
+  }],
+  "devices": [{
+    "id": "render",
+    "component": "server",
+    "container": "server",
+    "host_path": "/dev/dri/renderD128",
+    "description": "The GPU's DRM render node: Vulkan compute and GPU memory, no display output (no card node)."
+  }],
+  "identities": [{
+    "id": "gpu",
+    "kind": "gpu",
+    "name": "/dev/dri/renderD128",
+    "scope": "host",
+    "holders": ["server"],
+    "description": "LLM slot of the GPU, shared with Ollama: one model needs most of the GPU's memory, so at most one holder runs (start, unfence and plans refuse while another holds it; deploy switch-plan moves it)."
+  }, {
+    "id": "gpu-image",
+    "kind": "gpu",
+    "name": "/dev/dri/renderD128 image slot",
+    "scope": "host",
+    "holders": ["server"],
+    "description": "Image slot of the GPU, shared with ComfyUI: a llama.cpp server also excludes ComfyUI, while Ollama (LLM slot only) and ComfyUI (image slot only) may run together and take turns on VRAM."
+  }],
+  "endpoints": [{
+    "id": "http",
+    "component": "server",
+    "protocol": "tcp",
+    "target_port": 8080,
+    "consumers": [
+      "No authentication: every host that can reach this address and port can send prompts and use the API and chat page",
+      "OpenAI-compatible clients at http://ADDRESS:PORT/v1",
+      "Browsers (the chat page needs gzip; curl needs --compressed)"
+    ]
+  }],
+  "requires": [
+    {"name": "podman"},
+    {"name": "systemd"},
+    {"name": "gpu", "components": ["server"], "capacity": {"gpu": "Vulkan-capable GPU render node (Mesa RADV on the RX 7900 XTX); VRAM for the chosen model and context (27B Q4_K_XL at 64K q8_0 KV: about 19-20 GB)"}}
+  ],
+  "health_checks": [{
+    "id": "health",
+    "component": "server",
+    "type": "http",
+    "endpoint": "http",
+    "path": "/health",
+    "status": 200,
+    "redirects": false,
+    "timeout_seconds": 5,
+    "ready_within_seconds": 120
+  }],
+  "provenance": {
+    "submitted_by": "switchyard-operator",
+    "source": "catalogs/templates/llama-server-vulkan.json",
+    "evidence": [
+      "The image runs /app/llama-server as its entrypoint; the tag's digest is resolved at plan time and pinned in the instance"
+    ]
+  }
+}

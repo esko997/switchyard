@@ -1,0 +1,97 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Bundle",
+  "applications": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Application",
+      "id": "test-sync-job",
+      "revision": 1,
+      "name": "TEST synchronization job",
+      "purpose": "Synthetic scheduled synchronization job on the controller.",
+      "role": "instance",
+      "template_ref": null,
+      "components": [
+        {
+          "id": "main",
+          "native": {
+            "kind": "observed",
+            "backend": "systemd",
+            "resource_kind": "scheduled-job"
+          },
+          "sources": [],
+          "depends_on": [],
+          "gates": []
+        }
+      ],
+      "datasets": [],
+      "secrets": [],
+      "endpoints": [],
+      "requires": [],
+      "external_dependencies": [],
+      "health_checks": [],
+      "consistency_groups": [],
+      "recipes": [],
+      "identities": [],
+      "parameters": [],
+      "config_files": [],
+      "notes": {
+        "text": "Timer and worker are grouped for observation only; no lifecycle control or dependency semantics are implied.",
+        "health": null,
+        "data_locations": [],
+        "workload_dependencies": []
+      },
+      "provenance": {
+        "submitted_by": "operator catalog",
+        "source": "catalogs/home-lab.json (seeded into the workload store)",
+        "evidence": []
+      }
+    }
+  ],
+  "placements": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Placement",
+      "id": "test-sync-job",
+      "application_id": "test-sync-job",
+      "revision": 1,
+      "host_id": "controller",
+      "generation": 1,
+      "state": "declared",
+      "ownership": "adopted",
+      "ownership_id": null,
+      "components": [
+        {
+          "component": "main",
+          "native_identities": [
+            {
+              "native_id": "test-sync-job.timer",
+              "scope": "user:1000",
+              "name": null,
+              "backend": "systemd",
+              "role": "primary"
+            },
+            {
+              "native_id": "test-sync-job.service",
+              "scope": "user:1000",
+              "name": null,
+              "backend": "systemd",
+              "role": "supporting"
+            }
+          ],
+          "source_paths": {},
+          "project_directory": null,
+          "launcher_path": null,
+          "ungated_reason": null
+        }
+      ],
+      "datasets": [],
+      "secrets": [],
+      "endpoints": [],
+      "reviewed_paths": [],
+      "fence": null,
+      "migration_recipe": null
+    }
+  ],
+  "activation_inputs": []
+}

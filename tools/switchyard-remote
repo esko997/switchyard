@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+"""Switchyard remote client: device leases and read-only Switchyard state for agents on other hosts.
+
+Installed as ~/.local/bin/switchyard on a registry host other than the control host by
+tools/install-remote-client.sh (Python 3 standard library only). The canonical device ledgers, their
+locks and Switchyard itself live on the control host; every command here runs there over
+`ssh -o BatchMode=yes`, configured by ~/.config/switchyard/remote.json:
+
+    {"control": "operator@192.0.2.5", "switchyard": "/home/operator/.local/bin/switchyard",
+     "mcp": "/home/operator/.local/bin/switchyard-mcp-remote", "host_id": "host-a"}
+
+`lease run` holds the lease through one SSH connection (`switchyard lease attach --heartbeat` on the
+control host): newline heartbeats every 15 s while the command runs, and a final `done` line once the
+command has exited and been reaped; only `done` (or an explicit `lease release`) releases. A lost
+connection is fail-closed: the control host keeps the lock as `suspect`, this client terminates the
+command and then tries to release explicitly. The command dies with this client (PR_SET_PDEATHSIG).
+Exit codes: the command's own; 75 busy (nothing ran); 76 the lease was lost while the command ran (the
+command was terminated); 255 the control host was unreachable; 2 usage errors and refused commands.
+
+Hosts without SSH trust to the control host enroll instead (`switchyard enroll --server https://...`): the
+client generates an API key, the operator approves the request in a browser, and `whoami`, `api GET`,
+`http-lease` and `unenroll` then use HTTPS verified against the CA pinned at enrollment. State lives in
+~/.config/switchyard/ (key 0600, ca.pem, client.json without secrets). Extra exit codes there: 1 denied,
+expired, revoked or certificate mismatch (nothing was sent); 3 still pending; 77 not allowed for this key.
+"""
+import argparse
+import base64
+import calendar
+import ctypes
+import getpass
+import hashlib
+import http.client
+import json
+import os
+import re
+import secrets
+import select
+import shlex
+import signal
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+LEASE_ENV = ("SWITCHYARD_LEASE_ID", "SWITCHYARD_DEVICE", "ANDROID_SERIAL", "SWITCHYARD_SSH_TARGET", "SWITCHYARD_SSH_PORT")
+STALE_ENV = LEASE_ENV + ("DEVICE_LOCK_FD",)
+EXIT_BUSY, EXIT_LOST, EXIT_USAGE, EXIT_UNREACHABLE = 75, 76, 2, 255
+CLAIM_GRACE = 20      # seconds beyond --wait for the control host to answer a lease request
+RELEASE_WAIT = 30     # seconds to wait for the control host to confirm RELEASE
+KILL_GRACE = 10       # seconds between SIGTERM and SIGKILL when a lease is lost
+HEARTBEAT_INTERVAL = 15  # seconds between newline heartbeats on the attach connection
+HEARTBEAT_WINDOW = 60    # silence after which the control host marks the lease suspect (lock kept)
+RELEASE_RETRY_WINDOW = 120  # seconds to keep trying `lease release` after a lost connection
+RELEASE_RETRY_PAUSE = 5     # seconds between those attempts
+PR_SET_PDEATHSIG = 1
+LEASE_ID = re.compile(r"[0-9a-f]{32}\Z")
+PASEO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+USER_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\Z")
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+USAGE = """usage: switchyard <command> ...   (remote client; the control host does the work)
+
+  lease run <device> --scope S [--wait N] [--owner O] -- CMD...   hold <device> for one command
+  lease hold <device> --scope S [--ttl 60m] [--wait N] [--owner O] multi-step hold (release it!)
+  lease release <lease-id|device>     lease renew <lease-id> [--ttl 30m]
+  lease status <device>               lease list [--json]
+  hosts | fleet | definitions | operations [--id ID]                read-only state
+  mcp                                 stdio MCP server (switchyard-mcp on the control host)
+
+  Without SSH trust to the control host (HTTPS with an enrolled key):
+  enroll --server https://HOST:PORT [--scope read|lease|operate] [--hosts a,b] [--name N]
+         [--ca-fingerprint sha256:HEX] [--no-wait] [--replace]      request a key; the operator approves
+  enroll --status                     check a pending request       whoami     what this key may do
+  api GET /api/PATH                   authenticated read (JSON)     unenroll   revoke and delete the key
+  http-lease hold <device> --scope S [--ttl MIN] | renew <id> [--ttl MIN] | release <id> | list
+
+Exit 75 = busy (nothing ran), 76 = lease lost while the command ran (command terminated),
+77 = not allowed for this key, 3 = enrollment still pending.
+"""
+
+
+def fail(message, code=EXIT_USAGE):
+    print(f"switchyard: {message}", file=sys.stderr)
+    return code
+
+
+def config_path():
+    return os.environ.get("SWITCHYARD_REMOTE_CONFIG") or os.path.expanduser("~/.config/switchyard/remote.json")
+
+
+def load_config():
+    path = config_path()
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)
+    except (OSError, ValueError) as error:
+        raise SystemExit(fail(f"cannot read remote client configuration {path}: {error} "
+                              "(install with tools/install-remote-client.sh on the control host)"))
+    if not isinstance(config, dict):
+        raise SystemExit(fail(f"{path} must be a JSON object"))
+    control = config.get("control")
+    if not isinstance(control, str) or not re.fullmatch(r"[A-Za-z0-9_.@:\[\]-]+", control) or control.startswith("-"):
+        raise SystemExit(fail(f"{path}: control must be an ssh target such as user@host"))
+    for key in ("switchyard", "mcp"):
+        if not isinstance(config.get(key), str) or not config[key].startswith("/"):
+            raise SystemExit(fail(f"{path}: {key} must be an absolute path on the control host"))
+    if not isinstance(config.get("host_id"), str) or not config["host_id"]:
+        raise SystemExit(fail(f"{path}: host_id must name this host's Switchyard registry ID"))
+    port = config.get("port")
+    if port is not None and (type(port) is not int or not 0 < port < 65536):
+        raise SystemExit(fail(f"{path}: port must be a TCP port"))
+    return config
+
+
+def ssh_argv(config, remote_argv):
+    argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
+    if config.get("port"):
+        argv += ["-p", str(config["port"])]
+    # ssh hands the command to the remote login shell as one string: quote every argument.
+    return [*argv, config["control"], " ".join(shlex.quote(item) for item in remote_argv)]
+
+
+def origin_args(config):
+    """Attribution: the Paseo agent that called us (PASEO_AGENT_ID), this host and user."""
+    argv = ["--origin-host", config["host_id"]]
+    agent_id = os.environ.get("PASEO_AGENT_ID", "")
+    if PASEO_ID.fullmatch(agent_id):
+        argv += ["--agent-id", agent_id]
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):
+        user = ""
+    if USER_NAME.fullmatch(user):
+        argv += ["--origin-user", user]
+    return argv
+
+
+def worktree(config):
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = "?"
+    return f"{config['host_id']}:{cwd}"[:500]
+
+
+def passthrough(config, remote_argv):
+    """Run one Switchyard command on the control host; its stdout, stderr and exit code are ours."""
+    try:
+        code = subprocess.run(ssh_argv(config, remote_argv), stdin=subprocess.DEVNULL).returncode
+    except FileNotFoundError:
+        return fail("ssh is not installed", EXIT_UNREACHABLE)
+    if code == EXIT_UNREACHABLE:
+        fail(f"ssh to the control host {config['control']} failed (exit 255)", EXIT_UNREACHABLE)
+    return code
+
+
+def parser(prog):
+    return argparse.ArgumentParser(prog=f"switchyard {prog}", add_help=True)
+
+
+class Signals:
+    """Record SIGINT/SIGTERM/SIGHUP and forward them to the command's process group once it runs."""
+    def __init__(self):
+        self.received, self.child, self.previous = [], None, {}
+
+    def __enter__(self):
+        for signum in FORWARDED:
+            self.previous[signum] = signal.signal(signum, self.handle)
+        return self
+
+    def handle(self, signum, _frame):
+        self.received.append(signum)
+        self.forward(signum)
+
+    def forward(self, signum):
+        if self.child is not None and self.child.poll() is None:
+            try:
+                os.killpg(self.child.pid, signum)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def __exit__(self, *_):
+        for signum, handler in self.previous.items():
+            signal.signal(signum, handler)
+
+
+class Channel:
+    """Line reader over the attach connection's stdout, bounded by deadlines; never blocks."""
+    def __init__(self, process):
+        self.process, self.buffer, self.eof = process, b"", False
+
+    def pump(self, timeout):
+        if self.eof:
+            return
+        try:
+            ready = select.select([self.process.stdout], [], [], max(0, timeout))[0]
+        except InterruptedError:
+            return
+        if ready:
+            data = os.read(self.process.stdout.fileno(), 65536)
+            if data:
+                self.buffer += data
+            else:
+                self.eof = True
+
+    def line(self):
+        if b"\n" not in self.buffer:
+            return None
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        return line
+
+    def message(self):
+        line = self.line()
+        if line is None:
+            return None
+        try:
+            value = json.loads(line)
+        except ValueError:
+            return {"status": "invalid", "raw": line[:200].decode("utf-8", "replace")}
+        return value if isinstance(value, dict) else {"status": "invalid"}
+
+
+def close_connection(ssh, wait, *, done=False):
+    """Close the attach connection's stdin and reap ssh. `done` first tells the control host that no
+    command is running (release now); without it the control host treats the close as a lost
+    connection and keeps the lock (suspect) until someone releases it."""
+    try:
+        if done:
+            os.set_blocking(ssh.stdin.fileno(), True)
+            os.write(ssh.stdin.fileno(), b"done\n")
+    except (OSError, ValueError):
+        pass
+    try:
+        ssh.stdin.close()
+    except OSError:
+        pass
+    try:
+        return ssh.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        ssh.kill()
+        ssh.wait()
+        return None
+    finally:
+        ssh.stdout.close()
+
+
+def die_with_parent(parent):
+    """preexec hook: the command gets SIGTERM if this client dies (Linux PR_SET_PDEATHSIG). Covers the
+    command's own process; descendants it starts are covered only if they set their own."""
+    def setup():
+        if sys.platform.startswith("linux"):
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+            if os.getppid() != parent:  # The client died before prctl took effect.
+                os.kill(os.getpid(), signal.SIGTERM)
+    return setup
+
+
+def release_after_loss(config, lease_id, device):
+    """After a lost connection (command already terminated and reaped): reconnect and release the lease,
+    which the control host otherwise keeps as `suspect`. Bounded attempts; reports the outcome."""
+    deadline = time.monotonic() + RELEASE_RETRY_WINDOW
+    attempt, detail = 0, ""
+    while True:
+        attempt += 1
+        argv = ssh_argv(config, [config["switchyard"], "lease", "release", lease_id])
+        argv[1:1] = ["-o", "ConnectTimeout=10"]
+        try:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            code, detail = result.returncode, (result.stderr or result.stdout).strip()[-300:]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            code, detail = EXIT_UNREACHABLE, str(error)
+        if code == 0:
+            print(f"switchyard: lease {lease_id} on {device} was released explicitly after the connection was lost "
+                  f"(attempt {attempt})", file=sys.stderr)
+            return True
+        if code != EXIT_UNREACHABLE:
+            # The control host answered: typically the lease already ended there (no longer active).
+            print(f"switchyard: release of lease {lease_id} on {device} refused by the control host "
+                  f"(exit {code}): {detail}. Check `switchyard lease status {device}`.", file=sys.stderr)
+            return False
+        if time.monotonic() + RELEASE_RETRY_PAUSE >= deadline:
+            break
+        time.sleep(RELEASE_RETRY_PAUSE)
+    print(f"switchyard: could not reach the control host after {attempt} attempts ({detail}). Lease {lease_id} on "
+          f"{device} is left SUSPECT and still held there; the command is no longer running, so clear it with "
+          f"`switchyard lease release {lease_id}` when the control host is reachable.", file=sys.stderr)
+    return False
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_command(child):
+    """SIGTERM the command's whole process group, then SIGKILL whatever is still in it after KILL_GRACE,
+    including descendants that ignore SIGTERM and outlive an exiting group leader."""
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    deadline = time.monotonic() + KILL_GRACE
+    while True:
+        child.poll()  # Reap the leader: an unreaped zombie would keep the group "alive".
+        if not group_alive(child.pid):
+            break
+        if time.monotonic() >= deadline:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            break
+        time.sleep(0.1)
+    return child.wait()
+
+
+def lease_run(config, arguments):
+    if "--" not in arguments:
+        return fail("lease run needs a command after --")
+    delimiter = arguments.index("--")
+    command = arguments[delimiter + 1:]
+    options = parser("lease run")
+    options.add_argument("device")
+    options.add_argument("--scope", required=True)
+    options.add_argument("--wait", type=float, default=0)
+    options.add_argument("--owner")
+    options.add_argument("--pass-lock-fd", action="store_true", help=argparse.SUPPRESS)
+    args = options.parse_args(arguments[:delimiter])
+    if args.pass_lock_fd:
+        return fail("--pass-lock-fd is unavailable remotely: the ledger descriptor lives on the control host")
+    if not command:
+        return fail("lease run needs a command after --")
+    if not 0 <= args.wait <= 600:
+        return fail("--wait must be between 0 and 600 seconds")
+    remote = [config["switchyard"], "lease", "attach", args.device, "--scope", args.scope,
+              "--wait", format(args.wait, "g"), "--heartbeat", format(HEARTBEAT_WINDOW, "g"),
+              "--worktree", worktree(config), *origin_args(config)]
+    if args.owner:
+        remote += ["--owner", args.owner]
+    with Signals() as signals:
+        try:
+            # Own session: a terminal Ctrl-C reaches the command (forwarded), never the lease connection.
+            ssh = subprocess.Popen(ssh_argv(config, remote), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   start_new_session=True)
+        except FileNotFoundError:
+            return fail("ssh is not installed", EXIT_UNREACHABLE)
+        channel = Channel(ssh)
+        deadline = time.monotonic() + args.wait + CLAIM_GRACE
+        claim = None
+        while claim is None and not signals.received and not channel.eof and time.monotonic() < deadline:
+            channel.pump(min(0.2, deadline - time.monotonic()))
+            claim = channel.message()
+        if claim is None:
+            # Nothing ran: `done` lets the control host release at once if it claimed in the meantime.
+            if signals.received:
+                close_connection(ssh, 5, done=True)
+                return 128 + signals.received[0]
+            if not channel.eof:
+                close_connection(ssh, 5, done=True)
+                return fail(f"no answer from the control host within {args.wait + CLAIM_GRACE:g}s; nothing ran", EXIT_BUSY)
+            code = close_connection(ssh, 5)
+            if code == EXIT_BUSY:
+                return EXIT_BUSY  # The holder message already went to stderr.
+            if code == EXIT_UNREACHABLE:
+                return fail(f"cannot reach the control host {config['control']} over ssh; nothing ran", EXIT_UNREACHABLE)
+            return fail(f"lease request failed (exit {code}); nothing ran", code or EXIT_USAGE)
+        lease_id = claim.get("lease_id")
+        if claim.get("status") != "claimed" or not isinstance(claim.get("env"), dict) or \
+                not isinstance(lease_id, str) or not LEASE_ID.fullmatch(lease_id):
+            close_connection(ssh, 5, done=True)
+            return fail(f"unexpected reply from the control host: {claim}")
+        device = claim.get("device") or args.device
+        environment = dict(os.environ)
+        for key in STALE_ENV:
+            environment.pop(key, None)
+        environment.update({key: value for key, value in claim["env"].items()
+                            if key in LEASE_ENV and isinstance(value, str) and "\0" not in value})
+        try:
+            # Own session (signals are forwarded), and PR_SET_PDEATHSIG: if this client dies, so does the command.
+            signals.child = subprocess.Popen(command, env=environment, start_new_session=True,
+                                             preexec_fn=die_with_parent(os.getpid()))
+        except (OSError, subprocess.SubprocessError) as error:
+            close_connection(ssh, RELEASE_WAIT, done=True)
+            return fail(f"cannot run {command[0]}: {error}", 127)
+        child = signals.child
+        for signum in signals.received:
+            signals.forward(signum)
+        lost = None
+        beat = ssh.stdin.fileno()
+        os.set_blocking(beat, False)
+        next_beat = time.monotonic() + HEARTBEAT_INTERVAL
+        while child.poll() is None:
+            channel.pump(0.2)
+            message = channel.message()
+            if message is not None:
+                ended = message.get("reason") or message.get("status") or "unexpected message"
+                lost = f"the control host ended the lease ({ended})"
+            elif channel.eof or ssh.poll() is not None:
+                lost = "connection to the control host ended"
+            elif time.monotonic() >= next_beat:
+                # Proves this client is alive; the control host marks the lease suspect after HEARTBEAT_WINDOW of silence.
+                next_beat = time.monotonic() + HEARTBEAT_INTERVAL
+                try:
+                    os.write(beat, b"\n")
+                except BlockingIOError:
+                    pass  # ssh is not draining its stdin; the control host's window decides.
+                except OSError:
+                    lost = "heartbeats can no longer be written to the control host"
+            if lost:
+                break
+        if lost and (child.poll() is None or group_alive(child.pid)):
+            print(f"switchyard: LEASE LOST on {device} ({lost}) while the command was running: the device is no "
+                  "longer safely reserved. Terminating the command (SIGTERM, SIGKILL after 10 s).", file=sys.stderr)
+            stop_command(child)  # Returns only once the command is reaped and its process group is empty.
+            close_connection(ssh, 5)
+            if message is None:
+                release_after_loss(config, lease_id, device)
+            return EXIT_LOST
+        code = child.wait()
+        exit_code = code if code >= 0 else 128 - code
+        # The command is reaped: `done` is the release; the control host answers with a `released` line.
+        os.set_blocking(beat, True)
+        try:
+            os.write(beat, b"done\n")
+        except OSError:
+            pass
+        try:
+            ssh.stdin.close()
+        except OSError:
+            pass
+        released = None
+        until = time.monotonic() + RELEASE_WAIT
+        while not channel.eof and time.monotonic() < until:
+            channel.pump(min(0.2, until - time.monotonic()))
+            message = channel.message()
+            if message is not None and message.get("status") == "released":
+                released = message
+        status = close_connection(ssh, 5)
+        if released is None or status != 0:
+            print(f"switchyard: release of {device} was not confirmed (ssh exit {status}); releasing it explicitly",
+                  file=sys.stderr)
+            release_after_loss(config, lease_id, device)
+        elif released.get("reason") != "released":
+            print(f"switchyard: lease on {device} ended early ({released.get('reason')}) before the command finished",
+                  file=sys.stderr)
+        return exit_code
+
+
+def lease(config, arguments):
+    action, rest = (arguments[0], arguments[1:]) if arguments else ("", [])
+    if action == "run":
+        return lease_run(config, rest)
+    remote = [config["switchyard"], "lease", action]
+    options = parser(f"lease {action}")
+    if action == "hold":
+        options.add_argument("device")
+        options.add_argument("--scope", required=True)
+        options.add_argument("--ttl", default="60m")
+        options.add_argument("--wait", type=float, default=0)
+        options.add_argument("--owner")
+        args = options.parse_args(rest)
+        # The owning agent runs here, not on the control host: a TTL-only (detached) hold.
+        remote += [args.device, "--scope", args.scope, "--ttl", args.ttl, "--wait", format(args.wait, "g"),
+                   "--detached", "--worktree", worktree(config), *origin_args(config)]
+        if args.owner:
+            remote += ["--owner", args.owner]
+    elif action == "release":
+        options.add_argument("reference")
+        remote.append(options.parse_args(rest).reference)
+    elif action == "renew":
+        options.add_argument("lease_id")
+        options.add_argument("--ttl", default="60m")
+        args = options.parse_args(rest)
+        remote += [args.lease_id, "--ttl", args.ttl]
+    elif action == "status":
+        options.add_argument("device")
+        remote.append(options.parse_args(rest).device)
+    elif action == "list":
+        options.add_argument("--json", action="store_true")
+        if options.parse_args(rest).json:
+            remote.append("--json")
+    elif action in {"break", "clear"}:
+        return fail(f"`lease {action}` is the operator's breakglass and runs only at a terminal on the control host; "
+                    "agents must defer and tell the user (a blocked or suspect device stays unavailable until then)")
+    else:
+        return fail(f"`lease {action}` is not available from a remote host; use lease run|hold|release|renew|status|list")
+    return passthrough(config, remote)
+
+
+def read_only(config, command, arguments):
+    options = parser(command)
+    if command == "operations":
+        options.add_argument("--id")
+    args = options.parse_args(arguments)
+    remote = [config["switchyard"], command]
+    if getattr(args, "id", None):
+        remote += ["--id", args.id]
+    return passthrough(config, remote)
+
+
+# ---- Enrollment and keyed HTTPS access (round 11 contract: /api/enroll, /api/auth/session, /api/leases) ----
+#
+# Trust: the first `enroll` downloads the CA over an unverified TLS connection that carries nothing but
+# `GET /api/tls/ca`, then proves on a second, verified connection (CA chain plus hostname/IP check) that the
+# server's certificate chains to that CA, names this address and is the certificate seen the first time.
+# Only then is anything sent. Every later connection is verified against the stored CA; verification is
+# never disabled. The bearer key is generated here and only its SHA-256 leaves this host before approval.
+
+EXIT_REFUSED, EXIT_PENDING, EXIT_SCOPE = 1, 3, 77
+CLIENT_VERSION = "1"
+KEY_FORMAT = re.compile(r"sy1_[A-Za-z0-9_-]{43}\Z")
+REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+HOST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+PEM_CERTIFICATE = re.compile(rb"-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+?)-----END CERTIFICATE-----")
+HTTP_TIMEOUT = 30
+MAX_RESPONSE = 4 * 1024 * 1024
+MIN_POLL_SECONDS, MAX_POLL_SECONDS, DEFAULT_POLL_SECONDS = 1, 60, 5
+DECISION_GRACE = 60   # seconds after a request's expires_at before giving up on an unreachable server
+
+
+class HTTPFailure(Exception):
+    def __init__(self, message, code=EXIT_REFUSED):
+        super().__init__(message)
+        self.message, self.code = message, code
+
+
+def pause(seconds):
+    time.sleep(seconds)
+
+
+def state_dir():
+    return os.environ.get("SWITCHYARD_CONFIG_DIR") or os.path.expanduser("~/.config/switchyard")
+
+
+def state_path(name):
+    return os.path.join(state_dir(), name)
+
+
+def prepare_dir():
+    directory = state_dir()
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    info = os.lstat(directory)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise HTTPFailure(f"{directory} must be a directory owned by you", EXIT_USAGE)
+    if info.st_mode & 0o077:
+        os.chmod(directory, 0o700)
+    return directory
+
+
+def write_private(name, data):
+    """Atomic 0600 write (temporary file in the same directory, fsync, rename)."""
+    directory = prepare_dir()
+    fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, os.path.join(directory, name))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def read_private(name, limit=1024 * 1024):
+    try:
+        fd = os.open(state_path(name), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise HTTPFailure(f"cannot read {state_path(name)}: {error}", EXIT_USAGE)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise HTTPFailure(f"{state_path(name)} must be a regular file owned by you with mode 0600", EXIT_USAGE)
+        return stream.read(limit)
+
+
+def load_state():
+    data = read_private("client.json")
+    if data is None:
+        return {}
+    try:
+        value = json.loads(data)
+    except ValueError as error:
+        raise HTTPFailure(f"{state_path('client.json')} is not valid JSON: {error}", EXIT_USAGE)
+    return value if isinstance(value, dict) else {}
+
+
+def save_state(state):
+    write_private("client.json", (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
+
+
+def read_key():
+    data = read_private("key", 4096)
+    if data is None:
+        return None
+    key = data.decode("ascii", "replace").strip()
+    if not KEY_FORMAT.fullmatch(key):
+        raise HTTPFailure(f"{state_path('key')} does not hold a Switchyard key", EXIT_USAGE)
+    return key
+
+
+def remove_key():
+    try:
+        os.unlink(state_path("key"))
+    except FileNotFoundError:
+        pass
+
+
+def new_key():
+    """`sy1_` + 43 base64url characters of 32 random bytes; returns (bearer, lowercase hex SHA-256)."""
+    bearer = "sy1_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+    return bearer, hashlib.sha256(bearer.encode("ascii")).hexdigest()
+
+
+def enrollment_code(leaf_der, key_sha256, request_id):
+    """Contract: first 40 bits of SHA-256(<leaf cert DER SHA-256 hex>:<key_sha256>:<id>), base32, XXXX-XXXX."""
+    leaf_hex = hashlib.sha256(leaf_der).hexdigest()
+    digest = hashlib.sha256(f"{leaf_hex}:{key_sha256}:{request_id}".encode("utf-8")).digest()
+    text = base64.b32encode(digest[:5]).decode("ascii")
+    return f"{text[:4]}-{text[4:]}"
+
+
+def fingerprint_of(der):
+    return "sha256:" + hashlib.sha256(der).hexdigest()
+
+
+def normalize_fingerprint(value):
+    text = value.strip().lower()
+    if text.startswith("sha256:"):
+        text = text[len("sha256:"):]
+    text = re.sub(r"[\s:]", "", text)
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise HTTPFailure("--ca-fingerprint must be a SHA-256 fingerprint (sha256:<64 hex digits>)", EXIT_USAGE)
+    return "sha256:" + text
+
+
+def single_certificate(pem):
+    blocks = PEM_CERTIFICATE.findall(pem)
+    if len(blocks) != 1:
+        raise HTTPFailure(f"the server's CA download holds {len(blocks)} certificates, not exactly one; refusing")
+    try:
+        der = base64.b64decode(b"".join(blocks[0].split()), validate=True)
+    except ValueError:
+        raise HTTPFailure("the server's CA download is not a valid PEM certificate; refusing")
+    return der, ssl.DER_cert_to_PEM_cert(der)
+
+
+def parse_server(value):
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port or 443
+    except ValueError:
+        raise HTTPFailure("--server must look like https://HOST:PORT", EXIT_USAGE)
+    if (parts.scheme != "https" or not parts.hostname or parts.path not in ("", "/") or parts.query
+            or parts.fragment or parts.username or parts.password):
+        raise HTTPFailure("--server must look like https://HOST:PORT (HTTPS, no path)", EXIT_USAGE)
+    host = parts.hostname
+    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    return {"url": f"https://{authority}", "host": host, "port": port}
+
+
+def verified_context(ca_pem):
+    """Trust exactly this CA (no system store), require a certificate and check the hostname or IP."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_verify_locations(cadata=ca_pem)
+    except ssl.SSLError as error:
+        raise HTTPFailure(f"the CA certificate cannot be used ({error}); refusing")
+    return context
+
+
+def connect(server, context, trust):
+    """Open and handshake a TLS connection before any request byte is written."""
+    connection = http.client.HTTPSConnection(server["host"], server["port"], context=context, timeout=HTTP_TIMEOUT)
+    try:
+        connection.connect()
+    except ssl.SSLCertVerificationError as error:
+        connection.close()
+        reason = getattr(error, "verify_message", None) or str(error)
+        raise HTTPFailure(f"the certificate presented by {server['url']} does not match {trust} ({reason}); "
+                          "nothing was sent")
+    except ssl.SSLError as error:
+        connection.close()
+        raise HTTPFailure(f"the TLS handshake with {server['url']} failed ({error}); nothing was sent")
+    except OSError as error:
+        connection.close()
+        raise HTTPFailure(f"cannot reach {server['url']}: {error}", EXIT_UNREACHABLE)
+    return connection
+
+
+def exchange(connection, method, path, body=None, bearer=None):
+    """One request on an already verified (or, for the CA download only, unverified) connection.
+    Returns (status, raw bytes, parsed JSON or None)."""
+    headers = {"Accept": "application/json", "User-Agent": f"switchyard-remote/{CLIENT_VERSION}"}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if bearer is not None:
+        headers["Authorization"] = f"Bearer {bearer}"
+    try:
+        connection.request(method, path, body=payload, headers=headers)
+        response = connection.getresponse()
+        data = response.read(MAX_RESPONSE + 1)
+    except (OSError, http.client.HTTPException) as error:
+        raise HTTPFailure(f"the connection to the server failed during {method} {path} ({error}); "
+                          "the server may or may not have processed it", EXIT_UNREACHABLE)
+    if len(data) > MAX_RESPONSE:
+        raise HTTPFailure(f"the server's answer to {method} {path} is too large")
+    try:
+        value = json.loads(data) if data and "json" in (response.getheader("Content-Type") or "") else None
+    except ValueError:
+        value = None
+    return response.status, data, value
+
+
+def server_error(status, data, value):
+    message = value.get("error") if isinstance(value, dict) else None
+    return message or data[:300].decode("utf-8", "replace").strip() or f"HTTP {status}"
+
+
+def fetch_ca(server):
+    """The only unverified connection: download the CA and record the certificate this connection presented."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = connect(server, context, "anything (unverified)")
+    try:
+        leaf = connection.sock.getpeercert(binary_form=True)
+        status, data, value = exchange(connection, "GET", "/api/tls/ca")
+    finally:
+        connection.close()
+    if status != 200:
+        raise HTTPFailure(f"GET /api/tls/ca on {server['url']} answered {status}: {server_error(status, data, value)}")
+    return leaf, data
+
+
+def establish_trust(server, pin, state):
+    """Returns (verified connection, presented leaf DER, CA fingerprint, whether the CA is newly trusted)."""
+    stored = read_private("ca.pem") if state.get("server") == server["url"] else None
+    if stored is not None:
+        der, pem = single_certificate(stored)
+        fingerprint = fingerprint_of(der)
+        if pin and pin != fingerprint:
+            raise HTTPFailure(f"the CA stored for {server['url']} has fingerprint {fingerprint}, not {pin}; nothing was "
+                              f"sent. If the operator replaced the CA, delete {state_path('ca.pem')} and enroll again.")
+        connection = connect(server, verified_context(pem), f"the stored CA ({state_path('ca.pem')})")
+        return connection, connection.sock.getpeercert(binary_form=True), fingerprint, False
+    first_leaf, served = fetch_ca(server)
+    der, pem = single_certificate(served)
+    fingerprint = fingerprint_of(der)
+    if pin and pin != fingerprint:
+        raise HTTPFailure(f"{server['url']} serves a CA with fingerprint {fingerprint}, not the expected {pin}; "
+                          "refusing (nothing was sent)")
+    connection = connect(server, verified_context(pem),
+                         "the CA it served (the certificate does not chain to it or does not name this address)")
+    leaf = connection.sock.getpeercert(binary_form=True)
+    if leaf != first_leaf:
+        connection.close()
+        raise HTTPFailure(f"{server['url']} presented a different certificate on the verified connection than on "
+                          "the CA download; refusing (nothing was sent)")
+    write_private("ca.pem", pem.encode("ascii"))
+    return connection, leaf, fingerprint, True
+
+
+def call(state, method, path, body=None, *, bearer=None, map_401=True):
+    """A request to the enrolled server over a connection verified against the stored CA."""
+    if not state.get("server"):
+        raise HTTPFailure("this host is not enrolled; run `switchyard enroll --server https://HOST:PORT`")
+    server = parse_server(state["server"])
+    ca = read_private("ca.pem")
+    if ca is None:
+        raise HTTPFailure(f"{state_path('ca.pem')} is missing; enroll again")
+    _, pem = single_certificate(ca)
+    bearer = bearer or read_key()
+    if bearer is None:
+        raise HTTPFailure(f"no key at {state_path('key')}; enroll with `switchyard enroll --server {server['url']}`")
+    connection = connect(server, verified_context(pem), f"the stored CA ({state_path('ca.pem')})")
+    try:
+        status, data, value = exchange(connection, method, path, body, bearer)
+    finally:
+        connection.close()
+    if status == 401 and map_401:
+        raise HTTPFailure(f"the key is expired or revoked; enroll again: switchyard enroll --server {server['url']} --replace")
+    return status, data, value
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def origin_host_id():
+    """The registry host ID the SSH installer recorded for this host, if any."""
+    try:
+        with open(config_path(), encoding="utf-8") as stream:
+            value = json.load(stream).get("host_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and HOST_ID.fullmatch(value) else None
+
+
+def describe_key(key, server=None):
+    key = key if isinstance(key, dict) else {}
+    hosts = ", ".join(str(item) for item in key.get("hosts") or []) or (
+        "none (a read key has no host list)" if key.get("scope") == "read" else "none")
+    lines = [f"key: {key.get('id') or '?'}" + (f" ({key['label']})" if key.get("label") else ""),
+             f"scope: {key.get('scope') or '?'}", f"hosts: {hosts}", f"expires: {key.get('expires_at') or '?'}"]
+    if server:
+        lines.append(f"server: {server}")
+    return "\n".join(lines)
+
+
+def poll_once(state):
+    """One `GET /api/enroll/<id>`; records the outcome and deletes the unused key on denial or expiry."""
+    status, data, value = call(state, "GET", f"/api/enroll/{state['request_id']}", map_401=False)
+    if status in (401, 404):
+        result = "expired"  # The server no longer knows this request (or this key) for it.
+    elif status == 200 and isinstance(value, dict) and value.get("status") in {"pending", "approved", "denied", "expired"}:
+        result = value["status"]
+    else:
+        raise HTTPFailure(f"unexpected answer to the enrollment poll ({status}): {server_error(status, data, value)}")
+    if result == "pending":
+        return result
+    if result == "approved":
+        state.update(status="approved", key=value.get("key") if isinstance(value.get("key"), dict) else {},
+                     decided_at=now_iso())
+    else:
+        remove_key()
+        state.update(status=result, decided_at=now_iso())
+    save_state(state)
+    return result
+
+
+def report_decision(result, state):
+    if result == "approved":
+        print(f"Approved. This host's key is stored at {state_path('key')}.")
+        print(describe_key(state.get("key"), state.get("server")))
+        return 0
+    if result == "pending":
+        print(f"Request {state.get('request_id')} is still pending (expires {state.get('expires_at') or '?'}).")
+        return EXIT_PENDING
+    if result == "denied":
+        print("The operator denied the request. The unused key was deleted.")
+    else:
+        print("The request expired before it was approved. The unused key was deleted; run `switchyard enroll` again.")
+    return EXIT_REFUSED
+
+
+def wait_for_decision(state):
+    interval = state.get("poll_after_seconds")
+    interval = DEFAULT_POLL_SECONDS if isinstance(interval, bool) or not isinstance(interval, (int, float)) else interval
+    interval = max(MIN_POLL_SECONDS, min(MAX_POLL_SECONDS, interval))
+    print("Waiting for the operator (Ctrl-C stops waiting; the request stays pending).", flush=True)
+    try:
+        deadline = calendar.timegm(time.strptime(state["expires_at"][:19], "%Y-%m-%dT%H:%M:%S")) + DECISION_GRACE
+    except (KeyError, TypeError, ValueError, OverflowError):
+        deadline = time.time() + 15 * 60 + DECISION_GRACE
+    warned = False
+    try:
+        while True:
+            pause(interval)
+            try:
+                result = poll_once(state)
+            except HTTPFailure as error:
+                if error.code != EXIT_UNREACHABLE:
+                    raise
+                if time.time() > deadline:
+                    remove_key()
+                    state.update(status="expired", decided_at=now_iso())
+                    save_state(state)
+                    raise HTTPFailure(f"the server stayed unreachable until the request expired ({error.message}); "
+                                      "the unused key was deleted")
+                if not warned:
+                    print(f"switchyard: {error.message}; still trying", file=sys.stderr, flush=True)
+                    warned = True
+                continue
+            if result != "pending":
+                return report_decision(result, state)
+    except KeyboardInterrupt:
+        print(f"\nStopped waiting. Request {state.get('request_id')} stays pending until "
+              f"{state.get('expires_at') or 'it expires'}; resume with `switchyard enroll --status`.", file=sys.stderr)
+        return 130
+
+
+def enroll_status():
+    state = load_state()
+    if not state.get("request_id"):
+        return fail("no enrollment on record; run `switchyard enroll --server https://HOST:PORT`", EXIT_REFUSED)
+    if state.get("status") == "pending":
+        return report_decision(poll_once(state), state)
+    if state.get("status") == "approved":
+        print(f"Approved (request {state['request_id']}). `switchyard whoami` checks the key with the server.")
+        print(describe_key(state.get("key"), state.get("server")))
+        return 0
+    print(f"Request {state['request_id']}: {state.get('status') or 'unknown'}. Run `switchyard enroll` to request a new key.")
+    return EXIT_REFUSED
+
+
+def replace_existing(state):
+    """`enroll --replace`: best-effort self-revocation of the old key, then delete it locally."""
+    if state.get("status") == "approved":
+        key_id = (state.get("key") or {}).get("id") or "?"
+        try:
+            status, data, value = call(state, "POST", "/api/keys/self/revoke", map_401=False)
+            if status in (200, 204):
+                print(f"Revoked the old key {key_id}.")
+            elif status == 401:
+                print(f"The old key {key_id} was already expired or revoked.")
+            else:
+                print(f"switchyard: could not revoke the old key {key_id} ({status}: {server_error(status, data, value)}); "
+                      "ask the operator to revoke it", file=sys.stderr)
+        except HTTPFailure as error:
+            print(f"switchyard: could not revoke the old key {key_id} ({error.message}); ask the operator to revoke it",
+                  file=sys.stderr)
+    elif state.get("status") == "pending":
+        print(f"Abandoning pending request {state.get('request_id')}; it expires on its own.")
+    remove_key()
+    state.update(status="replaced", decided_at=now_iso())
+    save_state(state)
+
+
+def enroll(arguments):
+    options = parser("enroll")
+    options.add_argument("--server", help="https://HOST:PORT of the Switchyard LAN listener")
+    options.add_argument("--scope", choices=["read", "lease", "operate"], default="read")
+    options.add_argument("--hosts", help="comma-separated registry host IDs (lease and operate)")
+    options.add_argument("--name", help="what the operator sees (default: this hostname)")
+    options.add_argument("--host-id", help="this host's registry ID (default: from remote.json if installed)")
+    options.add_argument("--ca-fingerprint", help="expected CA fingerprint, sha256:HEX (from `switchyard tls show`)")
+    options.add_argument("--no-wait", action="store_true", help="submit the request and return")
+    options.add_argument("--replace", action="store_true", help="revoke and replace this host's existing key")
+    options.add_argument("--status", action="store_true", help="check the recorded request once")
+    args = options.parse_args(arguments)
+    if args.status:
+        if args.server or args.replace or args.hosts:
+            return fail("--status takes no other options")
+        return enroll_status()
+    if not args.server:
+        return fail("enroll needs --server https://HOST:PORT (or --status)")
+    server = parse_server(args.server)
+    hosts = []
+    for item in (args.hosts or "").split(","):
+        item = item.strip()
+        if item and item not in hosts:
+            if not HOST_ID.fullmatch(item):
+                return fail(f"--hosts: {item!r} is not a registry host ID")
+            hosts.append(item)
+    if args.scope == "read" and hosts:
+        return fail("a read key has no host list; --hosts applies to --scope lease or operate")
+    host_id = args.host_id or origin_host_id()
+    if host_id is not None and not HOST_ID.fullmatch(host_id):
+        return fail("--host-id is not a registry host ID")
+    name = (args.name or socket.gethostname() or "unnamed host").strip()[:128]
+    pin = normalize_fingerprint(args.ca_fingerprint) if args.ca_fingerprint else None
+    state = load_state()
+    if read_key() is not None:
+        if not args.replace:
+            if state.get("status") == "pending":
+                return fail(f"an enrollment request is already pending ({state.get('request_id')}); check it with "
+                            "`switchyard enroll --status`, or start over with --replace")
+            return fail(f"this host already has a key ({(state.get('key') or {}).get('id') or 'see client.json'}); "
+                        "use --replace to revoke it and enroll again, or `switchyard unenroll`")
+        replace_existing(state)
+    connection, leaf, fingerprint, fresh = establish_trust(server, pin, state)
+    try:
+        if fresh and not pin:
+            print(f"Trusting {server['url']} on first use. Its CA fingerprint is\n  {fingerprint}\n"
+                  "Compare it with `switchyard tls show` on the control host or the Access tab before approving.")
+        bearer, key_sha256 = new_key()
+        write_private("key", (bearer + "\n").encode("ascii"))
+        body = {"name": name, "user": getpass.getuser(), "scope": args.scope, "key_sha256": key_sha256,
+                "client": f"switchyard-remote/{CLIENT_VERSION} python/{sys.version_info[0]}.{sys.version_info[1]}"}
+        if host_id:
+            body["host_id"] = host_id
+        agent_id = os.environ.get("PASEO_AGENT_ID", "")
+        if PASEO_ID.fullmatch(agent_id):
+            body["agent_id"] = agent_id
+        if hosts:
+            body["hosts"] = hosts
+        state = {"server": server["url"], "ca_fingerprint": fingerprint, "name": name, "scope": args.scope,
+                 "hosts": hosts, "status": "requesting", "created_at": now_iso()}
+        save_state(state)
+        try:
+            status, data, value = exchange(connection, "POST", "/api/enroll", body)
+        except HTTPFailure:
+            remove_key()
+            state.update(status="failed")
+            save_state(state)
+            raise
+    finally:
+        connection.close()
+    request_id = value.get("id") if isinstance(value, dict) else None
+    if status != 201 or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        remove_key()
+        state.update(status="failed")
+        save_state(state)
+        if status == 429:
+            raise HTTPFailure("the server has too many pending enrollment requests; try again later")
+        raise HTTPFailure(f"the server refused the enrollment request ({status}): {server_error(status, data, value)}")
+    state.update(status="pending", request_id=request_id, expires_at=value.get("expires_at"),
+                 poll_after_seconds=value.get("poll_after_seconds"))
+    save_state(state)
+    code = enrollment_code(leaf, key_sha256, request_id)
+    print(f"Enrollment requested: {name}, scope {args.scope}"
+          + (f", hosts {', '.join(hosts)}" if hosts else "") + f" (request {request_id}).")
+    if args.scope != "read" and not hosts:
+        print("No hosts requested: the operator chooses which hosts this key may lease"
+              + (" and operate on." if args.scope == "operate" else "."))
+    # Built from the address typed here, not taken from the answer, so a tampered answer cannot redirect it.
+    print(f"Open this address on any device (a phone works), sign in and approve:\n  {server['url']}/#access/{request_id}")
+    print(f"Code: {code}")
+    print("Approve only if the Access page shows this same code for this request.", flush=True)
+    if value.get("code") not in (None, code):
+        print(f"switchyard: WARNING: the server reported code {value.get('code')}, not {code} as computed from the "
+              "certificate this host saw. The connection may be intercepted: the operator must deny this request.",
+              file=sys.stderr, flush=True)
+    if args.no_wait:
+        print("Not waiting. Check later with `switchyard enroll --status`.")
+        return 0
+    return wait_for_decision(state)
+
+
+def whoami(arguments):
+    parser("whoami").parse_args(arguments)
+    state = load_state()
+    status, data, value = call(state, "GET", "/api/auth/session")
+    if status != 200 or not isinstance(value, dict):
+        raise HTTPFailure(f"GET /api/auth/session answered {status}: {server_error(status, data, value)}")
+    if not value.get("authenticated") or value.get("kind") != "key":
+        raise HTTPFailure(f"the key is expired or revoked; enroll again: switchyard enroll --server {state['server']} --replace")
+    print("kind: key")
+    print(describe_key(value.get("key"), state.get("server")))
+    return 0
+
+
+def unenroll(arguments):
+    parser("unenroll").parse_args(arguments)
+    state = load_state()
+    if read_key() is None:
+        return fail("this host has no key", EXIT_REFUSED)
+    key_id = (state.get("key") or {}).get("id") or "?"
+    if state.get("status") == "approved":
+        try:
+            status, data, value = call(state, "POST", "/api/keys/self/revoke", map_401=False)
+        except HTTPFailure as error:
+            raise HTTPFailure(f"{error.message}. The key was kept so you can retry; or ask the operator to revoke key "
+                              f"{key_id}", error.code)
+        if status == 401:
+            print(f"Key {key_id} was already expired or revoked.")
+        elif status not in (200, 204):
+            raise HTTPFailure(f"the server refused to revoke key {key_id} ({status}: {server_error(status, data, value)}); "
+                              "the key was kept")
+        else:
+            print(f"Revoked key {key_id}.")
+    remove_key()
+    state.update(status="revoked", decided_at=now_iso())
+    save_state(state)
+    print(f"Deleted {state_path('key')}.")
+    return 0
+
+
+def api(arguments):
+    if len(arguments) != 2:
+        return fail("usage: switchyard api GET /api/PATH")
+    method, path = arguments
+    if method.upper() != "GET":
+        return fail("`switchyard api` performs GET requests only")
+    if not path.startswith("/") or path.startswith("//") or any(ch.isspace() or ord(ch) < 32 for ch in path):
+        return fail("the path must be a server path such as /api/hosts")
+    status, data, value = call(load_state(), "GET", path)
+    if 200 <= status < 300:
+        print(json.dumps(value, indent=2) if value is not None else data.decode("utf-8", "replace"))
+        return 0
+    return fail(f"GET {path} answered {status}: {server_error(status, data, value)}",
+                EXIT_SCOPE if status == 403 else EXIT_REFUSED)
+
+
+def http_lease(arguments):
+    action, rest = (arguments[0], arguments[1:]) if arguments else ("", [])
+    options = parser(f"http-lease {action}")
+    if action == "hold":
+        options.add_argument("device")
+        options.add_argument("--scope", required=True)
+        options.add_argument("--ttl", type=int, help="minutes (1-120; server default 60)")
+    elif action == "renew":
+        options.add_argument("lease_id")
+        options.add_argument("--ttl", type=int, help="minutes (1-120)")
+    elif action == "release":
+        options.add_argument("lease_id")
+    elif action != "list":
+        return fail("usage: switchyard http-lease hold <device> --scope S [--ttl MIN] | renew <id> | release <id> | list")
+    args = options.parse_args(rest)
+    if getattr(args, "ttl", None) is not None and not 1 <= args.ttl <= 120:
+        return fail("--ttl must be 1-120 minutes")
+    if getattr(args, "lease_id", None) is not None and not LEASE_ID.fullmatch(args.lease_id):
+        return fail("not a Switchyard lease ID")
+    state = load_state()
+    key = state.get("key") if isinstance(state.get("key"), dict) else {}
+    if key.get("scope") == "read":
+        return fail("this key's scope is read; it cannot take leases. Ask for a lease key: "
+                    "switchyard enroll --server ... --scope lease --hosts HOST --replace", EXIT_SCOPE)
+    if action == "list":
+        status, data, value = call(state, "GET", "/api/leases")
+    elif action == "hold":
+        body = {"device": args.device, "scope": args.scope}
+        if args.ttl is not None:
+            body["ttl_minutes"] = args.ttl
+        status, data, value = call(state, "POST", "/api/leases", body)
+    else:
+        body = {"ttl_minutes": args.ttl} if action == "renew" and args.ttl is not None else {}
+        status, data, value = call(state, "POST", f"/api/leases/{args.lease_id}/{action}", body)
+    if 200 <= status < 300:
+        if value is not None:
+            print(json.dumps(value, indent=2))
+        elif action == "release":
+            print(json.dumps({"lease_id": args.lease_id, "status": "released"}))
+        return 0
+    message = server_error(status, data, value)
+    if status == 409:
+        return fail(f"busy: {message}", EXIT_BUSY)
+    if status == 403:
+        allowed = (value.get("allowed_hosts") or value.get("hosts")) if isinstance(value, dict) else None
+        source = "the server"
+        if not isinstance(allowed, list):
+            allowed, source = key.get("hosts"), "the key as approved"
+        hint = f"; allowed hosts ({source}): {', '.join(allowed)}" if isinstance(allowed, list) and allowed else ""
+        return fail(f"not allowed for this key: {message}{hint}", EXIT_SCOPE)
+    if status == 404:
+        return fail(f"no such lease, or not one this key created: {message}", EXIT_REFUSED)
+    return fail(f"{action} answered {status}: {message}", EXIT_REFUSED)
+
+
+HTTP_COMMANDS = {"enroll": enroll, "whoami": whoami, "unenroll": unenroll, "api": api, "http-lease": http_lease}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        print(USAGE, end="")
+        return 0 if argv else EXIT_USAGE
+    command, rest = argv[0], argv[1:]
+    if command in HTTP_COMMANDS:
+        # Keyed HTTPS access: no SSH trust or remote.json needed.
+        try:
+            return HTTP_COMMANDS[command](rest)
+        except HTTPFailure as error:
+            return fail(error.message, error.code)
+    if command not in {"lease", "hosts", "fleet", "definitions", "operations", "mcp"}:
+        return fail(f"`{command}` is not available from a remote host. This client offers leases (lease run|hold|"
+                    "release|renew|status|list), read-only hosts|fleet|definitions|operations and mcp over SSH, and "
+                    "enroll|whoami|api|http-lease|unenroll over HTTPS; run operations, shell and edits on the "
+                    "control host.")
+    config = load_config()
+    if command == "lease":
+        return lease(config, rest)
+    if command == "mcp":
+        if rest:
+            return fail("mcp takes no arguments")
+        # Remote MCP mode on the control host: reduced tool set, detached holds attributed to this host/agent.
+        argv = ssh_argv(config, [config["mcp"], *origin_args(config)])
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as error:
+            return fail(f"cannot start ssh: {error}", EXIT_UNREACHABLE)
+    return read_only(config, command, rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

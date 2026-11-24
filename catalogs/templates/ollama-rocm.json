@@ -1,0 +1,47 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "ollama-rocm",
+  "revision": 2,
+  "role": "template",
+  "name": "Ollama (ROCm)",
+  "purpose": "Ollama model server on the host's Radeon GPU via ROCm, with its model store in an operator dataset. Holds the same exclusive GPU resource as the llama.cpp and ComfyUI deployments; at most one Ollama model is loaded at a time. The Ollama API has no authentication: anyone who can reach the port can chat, pull and delete models.",
+  "components": [{
+    "id": "server",
+    "native": {
+      "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "ollama-rocm"},
+        "spec": {
+          "restartPolicy": "Always", "terminationGracePeriodSeconds": 4,
+          "containers": [{
+            "name": "server",
+            "image": "docker.io/ollama/ollama:0.40.17-rocm@sha256:da9a8c4452ad453e7c256079fc3e0939efb1d8361706d4e437555a08c3162faa",
+            "env": [
+              {"name": "OLLAMA_HOST", "value": "0.0.0.0:11434"},
+              {"name": "OLLAMA_MAX_LOADED_MODELS", "value": "1"},
+              {"name": "OLLAMA_NUM_PARALLEL", "value": "1"},
+              {"name": "OLLAMA_CONTEXT_LENGTH", "value": "16384"},
+              {"name": "OLLAMA_KV_CACHE_TYPE", "value": "q8_0"},
+              {"name": "OLLAMA_VULKAN", "value": "0"}
+            ],
+            "ports": [{"name": "http", "containerPort": 11434, "protocol": "TCP"}],
+            "volumeMounts": [{"name": "store", "mountPath": "/root/.ollama"}],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+          }],
+          "volumes": [{"name": "store", "hostPath": {"path": "dataset://store", "type": "Directory"}}]
+        }
+      }
+    }
+  }],
+  "datasets": [{"id": "store", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["server"], "readers": ["server"]}],
+  "devices": [
+    {"id": "render", "component": "server", "container": "server", "host_path": "/dev/dri/renderD128", "description": "Radeon compute render node, not the display device."},
+    {"id": "kfd", "component": "server", "container": "server", "host_path": "/dev/kfd", "description": "AMD kernel compute device required by ROCm/HIP."}
+  ],
+  "identities": [{"id": "gpu", "kind": "gpu", "name": "/dev/dri/renderD128", "scope": "host", "holders": ["server"], "description": "Exclusive shared Radeon GPU: only one of Ollama, the llama.cpp deployments and ComfyUI runs at a time (deploy switch-plan moves it)."}],
+  "endpoints": [{"id": "http", "component": "server", "protocol": "tcp", "target_port": 11434, "consumers": ["Open WebUI and SillyTavern (Ollama API)", "No authentication: every host that can reach this address can chat, pull and delete models"]}],
+  "requires": [{"name": "podman"}, {"name": "systemd"}, {"name": "gpu", "components": ["server"], "capacity": {"gpu": "AMD GPU supported by ROCm/HIP"}}],
+  "health_checks": [{"id": "health", "component": "server", "type": "http", "endpoint": "http", "path": "/", "status": 200, "timeout_seconds": 5, "ready_within_seconds": 120}],
+  "provenance": {"submitted_by": "operator", "source": "catalogs/templates/ollama-rocm.json"}
+}

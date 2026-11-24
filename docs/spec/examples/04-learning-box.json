@@ -1,0 +1,53 @@
+{
+  "apiVersion": "switchyard/v1alpha3", "kind": "Bundle",
+  "applications": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "Application",
+    "id": "learning-box", "revision": 1, "name": "Learning Box",
+    "purpose": "Adopt the existing Quadlet: dependencies-only image, prod checkout read-only at /app, data read-write, host networking HTTPS :8443. Native configuration owns these mounts and network semantics.",
+    "components": [{"id": "web", "native": {"kind": "quadlet", "source": "container-file", "unit": "learning-box.service"}}],
+    "datasets": [{
+      "id": "data", "snapshot": "files-quiesced", "verify": "manifest-and-sqlite", "writers": ["web"],
+      "include": ["**"], "exclude": []
+    }],
+    "secrets": [
+      {"id": "environment", "kind": "environment-file", "consumers": ["web"], "transfer": "copy", "rotates_on_use": "unknown",
+       "locations": [{"id": "dotenv", "form": "value", "role": "holder", "component": "web"}]},
+      {"id": "openai-key", "kind": "file", "consumers": ["web"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "key-file", "form": "value", "role": "holder", "component": "web"}]},
+      {"id": "tablet-tls-identity", "kind": "credential", "consumers": ["web"], "transfer": "copy", "rotates_on_use": false,
+       "locations": [{"id": "in-data", "form": "value", "role": "holder", "component": "web", "dataset": "data"}]}
+    ],
+    "endpoints": [{"id": "https", "component": "web", "protocol": "tcp", "target_port": 8443, "consumers": ["Kids' tablet PWA and bookmarks", "Tablet-trusted TLS certificate identity", "Host firewall :8443"]}],
+    "requires": [{"name": "podman"}, {"name": "quadlet"}, {"name": "host-network", "probe_ref": "PLACEHOLDER-reviewed-8443-listener-and-firewall"}],
+    "health_checks": [
+      {"id": "no-working-cards", "component": "web", "type": "http", "endpoint": "https", "scheme": "https", "path": "/api/cards", "predicate_ref": "PLACEHOLDER-stored-no-cards-working-predicate"},
+      {"id": "binder-verified", "component": "web", "type": "predicate", "predicate_ref": "PLACEHOLDER-sqlite-integrity-media-and-tablet-TLS-acceptance"}
+    ],
+    "recipes": [{
+      "id": "planned-restart", "revision": 1,
+      "steps": [
+        {"id": "check-inflight-cards", "action": "verify", "target": {"kind": "component", "id": "web"}, "idempotent": true, "checks": ["no-working-cards"]},
+        {"id": "restart-native", "action": "restart", "target": {"kind": "component", "id": "web"}, "idempotent": false, "checks": ["binder-verified"], "checkpoint": "downtime"}
+      ]
+    }],
+    "provenance": {"submitted_by": "operator-review", "source": "synthetic-learning-box-example", "evidence": ["Synthetic adopted Quadlet example, not Switchyard deployment ownership.", "Image tag derives from requirements.txt; adopted file and image hashes are inspected and pinned at PLAN time.", "Exact environment/key/TLS relative paths require inspection; no secret values belong in the declaration."]}
+  }],
+  "placements": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "Placement",
+    "id": "learning-box-host-b", "application_id": "learning-box", "revision": 1,
+    "host_id": "host-b", "generation": 1, "state": "declared", "ownership": "adopted",
+    "components": [{
+      "component": "web",
+      "native_identities": [{"native_id": "learning-box.service", "scope": "user:1000"}, {"native_id": "learning-box", "scope": "podman:user:1000"}],
+      "source_paths": {"container-file": "/home/operator/.config/containers/systemd/learning-box.container"}
+    }],
+    "datasets": [{"dataset": "data", "path": "/home/operator/Repos/test-card-app/data", "access": "write", "ownership": "native", "ownership_check": "PLACEHOLDER-keep-id-and-mode-verification"}],
+    "secrets": [
+      {"secret": "environment", "location": "dotenv", "path": "PLACEHOLDER-canonical-dotenv-path"},
+      {"secret": "openai-key", "location": "key-file", "path": "PLACEHOLDER-OPENAI_API_KEY_FILE-outside-checkout"},
+      {"secret": "tablet-tls-identity", "location": "in-data", "relative_path": "PLACEHOLDER-TLS-identity-path"}
+    ],
+    "endpoints": [{"endpoint": "https", "address": "0.0.0.0", "host_port": 8443}],
+    "reviewed_paths": [{"id": "prod-checkout", "path": "/home/operator/Repos/test-card-app", "access": "read", "review_ref": "Existing Quadlet read-only /app bind; /app/data is the separate writable dataset."}]
+  }]
+}

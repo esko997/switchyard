@@ -1,0 +1,112 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Bundle",
+  "applications": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Application",
+      "id": "notes-stack",
+      "revision": 1,
+      "name": "Notes stack",
+      "purpose": "An existing Compose project (web and database) that Switchyard watches and may start, stop and restart when the operations policy grants it.",
+      "role": "instance",
+      "template_ref": null,
+      "components": [
+        {
+          "id": "main",
+          "native": {
+            "kind": "observed",
+            "backend": "podman",
+            "resource_kind": "service",
+            "runtime": {
+              "kind": "compose",
+              "provider": "podman-compose",
+              "project_name": "notes",
+              "project_directory": "/srv/notes",
+              "files": [
+                "/srv/notes/compose.yaml"
+              ],
+              "services": [
+                "web",
+                "db"
+              ]
+            }
+          },
+          "sources": [],
+          "depends_on": [],
+          "gates": []
+        }
+      ],
+      "datasets": [],
+      "secrets": [],
+      "endpoints": [],
+      "requires": [],
+      "external_dependencies": [],
+      "health_checks": [],
+      "consistency_groups": [],
+      "recipes": [],
+      "identities": [],
+      "parameters": [],
+      "config_files": [],
+      "notes": {
+        "text": "Both containers belong to one project; lifecycle acts on the complete service set.",
+        "health": null,
+        "data_locations": [
+          "/srv/notes/data"
+        ],
+        "workload_dependencies": []
+      },
+      "provenance": {
+        "submitted_by": "definition editor",
+        "source": "cached-discovery",
+        "evidence": []
+      }
+    }
+  ],
+  "placements": [
+    {
+      "apiVersion": "switchyard/v1alpha3",
+      "kind": "Placement",
+      "id": "notes-stack",
+      "application_id": "notes-stack",
+      "revision": 1,
+      "host_id": "host-a",
+      "generation": 1,
+      "state": "declared",
+      "ownership": "adopted",
+      "ownership_id": null,
+      "components": [
+        {
+          "component": "main",
+          "native_identities": [
+            {
+              "native_id": null,
+              "scope": "user:1000",
+              "name": "notes-web",
+              "backend": "podman",
+              "role": "primary"
+            },
+            {
+              "native_id": null,
+              "scope": "user:1000",
+              "name": "notes-db",
+              "backend": "podman",
+              "role": "supporting"
+            }
+          ],
+          "source_paths": {},
+          "project_directory": null,
+          "launcher_path": null,
+          "ungated_reason": null
+        }
+      ],
+      "datasets": [],
+      "secrets": [],
+      "endpoints": [],
+      "reviewed_paths": [],
+      "fence": null,
+      "migration_recipe": null
+    }
+  ],
+  "activation_inputs": []
+}

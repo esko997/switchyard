@@ -1,0 +1,53 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "comfyui-rocm",
+  "revision": 5,
+  "role": "template",
+  "name": "ComfyUI (ROCm)",
+  "purpose": "ComfyUI workflow editor with ComfyUI-Manager, on the same exclusive Radeon GPU as the llama.cpp and Ollama deployments. Runs from a persistent Python environment in the workspace (<workspace>/venv, seeded once from the image's /opt/venv) so packages that Manager installs for custom nodes survive restarts; torch is pinned by a pip constraint. Custom nodes load from <workspace>/custom_nodes. No ComfyUI authentication: anyone who can reach the port can run workflows and, through Manager (security_level normal), install custom nodes from the default registry.",
+  "components": [{
+    "id": "web",
+    "native": {
+      "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "comfyui-rocm"},
+        "spec": {
+          "restartPolicy": "Always", "terminationGracePeriodSeconds": 4,
+          "containers": [{
+            "name": "web",
+            "image": "docker.io/yanwk/comfyui-boot:rocm7@sha256:035d5df9f3a6f6a82d52608437ad3bbc85553dd112e7452fab1e2e6f409461ff",
+            "command": [
+              "/workspace/venv/bin/python", "-c",
+              "import runpy, signal, sys; path = sys.argv.pop(1); sys.argv[0] = path; sys.path.insert(0, path.rsplit('/', 1)[0]); signal.signal(signal.SIGTERM, signal.default_int_handler); runpy.run_path(path, run_name='__main__')",
+              "/default-comfyui-bundle/ComfyUI/main.py"
+            ],
+            "args": ["--listen", "0.0.0.0", "--port", "8188", "--base-directory", "/workspace", "--disable-auto-launch", "--disable-api-nodes", "--disable-smart-memory"],
+            "env": [
+              {"name": "PATH", "value": "/workspace/venv/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+              {"name": "VIRTUAL_ENV", "value": "/workspace/venv"},
+              {"name": "PIP_CONSTRAINT", "value": "/workspace/venv/torch-constraints.txt"},
+              {"name": "PYTHONPYCACHEPREFIX", "value": "/workspace/cache/pycache"},
+              {"name": "HF_HOME", "value": "/workspace/cache/huggingface"},
+              {"name": "TORCH_HOME", "value": "/workspace/cache/torch"}
+            ],
+            "ports": [{"name": "http", "containerPort": 8188, "protocol": "TCP"}],
+            "volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+          }],
+          "volumes": [{"name": "workspace", "hostPath": {"path": "dataset://workspace", "type": "Directory"}}]
+        }
+      }
+    }
+  }],
+  "datasets": [{"id": "workspace", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]}],
+  "devices": [
+    {"id": "render", "component": "web", "container": "web", "host_path": "/dev/dri/renderD128", "description": "Radeon compute render node, not the display device."},
+    {"id": "kfd", "component": "web", "container": "web", "host_path": "/dev/kfd", "description": "AMD kernel compute device required by ROCm/HIP."}
+  ],
+  "identities": [{"id": "gpu-image", "kind": "gpu", "name": "/dev/dri/renderD128 image slot", "scope": "host", "holders": ["web"], "description": "Image slot of the GPU: excludes the llama.cpp servers (which hold both slots) but not Ollama (LLM slot only). ComfyUI and Ollama take turns on VRAM: ComfyUI offloads models to RAM after each job and the chat model preset unloads after each reply."}],
+  "endpoints": [{"id": "http", "component": "web", "protocol": "tcp", "target_port": 8188, "consumers": ["Browsers and Open WebUI (ComfyUI image connection). No authentication: anyone who can reach the address can run workflows and, through Manager, install registry custom nodes."]}],
+  "requires": [{"name": "podman"}, {"name": "systemd"}, {"name": "gpu", "components": ["web"], "capacity": {"gpu": "AMD GPU supported by ROCm/HIP"}}],
+  "health_checks": [{"id": "health", "component": "web", "type": "http", "endpoint": "http", "path": "/system_stats", "status": 200, "timeout_seconds": 5, "ready_within_seconds": 120}],
+  "provenance": {"submitted_by": "operator", "source": "catalogs/templates/comfyui-rocm.json"}
+}

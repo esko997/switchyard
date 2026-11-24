@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "provenance": "Fictional offline nginx static-page design. No host, runtime or deployed workload is asserted by this catalog.",
+  "devices": [
+    {"id": "source", "name": "Fictional source", "platform": "linux", "architecture": "x86_64", "capabilities": ["linux", "docker"], "access": "declared-only", "observed_at": null, "provenance": "Fictional example", "notes": "No network address or credentials; Docker presence is not observed."},
+    {"id": "destination", "name": "Fictional destination", "platform": "linux", "architecture": "x86_64", "capabilities": ["linux", "docker"], "access": "declared-only", "observed_at": null, "provenance": "Fictional example", "notes": "All runtime, port and capacity conditions require independent observation."}
+  ],
+  "workloads": [
+    {
+      "id": "foobar",
+      "name": "Foobar static-page rehearsal",
+      "purpose": "Rehearse moving disposable static content and nginx configuration between two isolated hosts.",
+      "device_id": "source",
+      "backend": "docker",
+      "management": "defined",
+      "kind": "service",
+      "bindings": [{"backend": "docker", "scope": "system", "selector": {"name": "switchyard-foobar"}, "role": "primary"}],
+      "requirements": ["linux", "docker"],
+      "architectures": ["x86_64"],
+      "recipe": {
+        "schema_version": 1,
+        "kind": "static-web",
+        "stop": "After separate approval, stop only the exactly resolved disposable source container. Independently establish stopped state and no automatic restart or external activation.",
+        "transfer": "Retain unchanged source index.html and compose.yaml. Transfer only the static page and reviewed configuration into the dedicated destination directory; compare exact SHA256 and measured bytes against the declared budget. Transfer or retrieve the independently verified image content separately.",
+        "start": "Only after separate approval and verified Docker, image content, storage, dedicated name and port availability, start the disposable destination with readonly content, no restart, bounded resources and loopback-only port 18080.",
+        "verify": "Through localhost or an explicitly authorized tunnel, require HTTP 200 without redirects and hash the exact unmodified response body. Source and destination body SHA256 must match site.content_sha256; a listening port or nginx welcome page is insufficient.",
+        "recovery": "Before cutover, independently prove the destination stopped and retained source content unchanged, then request explicit approval to restart the exact source container. Never automatically restart or switch clients on an unknown outcome.",
+        "source": {
+          "definition_id": "foobar", "device_id": "source", "backend": "docker",
+          "scope": "system", "selector": {"name": "switchyard-foobar"}
+        },
+        "destination": {
+          "definition_id": "foobar", "device_id": "destination", "backend": "docker",
+          "scope": "system", "selector": {"name": "switchyard-foobar"},
+          "filesystem_id": "fictional-foobar-pool", "data_root": "/srv/switchyard-foobar"
+        },
+        "artifact": {
+          "kind": "image", "reference": "nginxinc/nginx-unprivileged:1.28.0-alpine",
+          "digest": null, "architectures": ["x86_64"], "reference_status": "unverified"
+        },
+        "site": {
+          "source_path": "/srv/switchyard-foobar/index.html",
+          "destination_path": "/srv/switchyard-foobar/index.html",
+          "container_path": "/usr/share/nginx/html/index.html",
+          "content_sha256": "sha256:a8b10871b3d8c6d6bcfefc5f646b0ee0f0ad8dbce5c7a9c95b61402f0205a20e",
+          "upper_bound_bytes": 65536, "read_only": true
+        },
+        "resources": {"cpu_count": 1, "memory_bytes": 67108864, "storage_reserve_bytes": 67108864},
+        "network": {"bind_address": "127.0.0.1", "host_port": 18080, "container_port": 8080, "protocol": "tcp"},
+        "restart_policy": "no",
+        "verification": {"method": "http-body-sha256", "path": "/", "expected_status": 200, "follow_redirects": false, "baseline": "unobserved"},
+        "recovery_conditions": {
+          "strategy": "restart-unchanged-source-before-cutover",
+          "require_destination_stopped": true, "require_source_unchanged": true,
+          "retain_source_content": true, "automatic_restart": false
+        }
+      },
+      "notes": "Fictional definition only. The authored asset hash is not an observation of either host. No container has been deployed or adopted and no operations are authorized.",
+      "health_check": "Descriptive only: localhost HTTP 200 with exact response body SHA256 matching recipe.site.content_sha256; never automatically requested.",
+      "data_locations": ["/srv/switchyard-foobar/index.html", "/srv/switchyard-foobar/compose.yaml"],
+      "dependencies": [],
+      "supported_operations": ["observe", "plan-migration"]
+    },
+    {
+      "id": "notes-sync",
+      "name": "Notes sync",
+      "purpose": "Fictional per-user sync service; catalogs/operations.example.json grants start, stop and restart on it.",
+      "device_id": "source",
+      "backend": "systemd",
+      "management": "defined",
+      "kind": "service",
+      "bindings": [{"backend": "systemd", "scope": "user:1000", "selector": {"native_id": "notes-sync.service"}, "role": "primary"}],
+      "requirements": ["linux", "systemd"],
+      "architectures": [],
+      "recipe": null,
+      "notes": "Fictional definition only. A plain systemd unit needs no runtime description; a Quadlet unit or a Compose project would add one (docs/spec/workload.md).",
+      "health_check": null,
+      "data_locations": [],
+      "dependencies": [],
+      "supported_operations": ["observe", "plan-migration"]
+    }
+  ]
+}

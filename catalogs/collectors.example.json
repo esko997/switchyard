@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "hosts": [
+    {
+      "host_id": "source",
+      "transport": "ssh",
+      "target": "operator@192.0.2.10",
+      "expected_hostname": "source",
+      "ledger": "/home/operator/.local/state/switchyard/ledgers/DEVICE_ACCESS_SOURCE.md",
+      "user_units": ["notes-sync.service", "notes-sync.timer"],
+      "system_units": [],
+      "container_engines": ["podman"],
+      "storage_mounts": ["/srv"],
+      "monitor": {"fast_seconds": 10, "storage_seconds": 60, "inventory_seconds": 300}
+    },
+    {
+      "host_id": "destination",
+      "transport": "ssh",
+      "target": "operator@192.0.2.11",
+      "expected_hostname": "destination",
+      "ledger": "/home/operator/.local/state/switchyard/ledgers/DEVICE_ACCESS_DESTINATION.md",
+      "user_units": [],
+      "system_units": [],
+      "container_engines": ["podman", "docker"]
+    }
+  ]
+}

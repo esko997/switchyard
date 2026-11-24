@@ -1,0 +1,46 @@
+{
+  "apiVersion": "switchyard/v1alpha3",
+  "kind": "Application",
+  "id": "open-webui",
+  "revision": 1,
+  "role": "template",
+  "name": "Open WebUI",
+  "purpose": "Password-protected LAN chat frontend for operator-configured OpenAI-compatible backends. Host GPU access is not needed. Bootstrap the first administrator privately before LAN activation.",
+  "parameters": [
+    {"id": "backend_urls", "description": "Required semicolon-separated OpenAI-compatible API base URLs, including each /v1 path.", "format": "text"}
+  ],
+  "components": [{
+    "id": "web",
+    "native": {
+      "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+      "manifest": {
+        "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "open-webui"},
+        "spec": {
+          "restartPolicy": "Always", "terminationGracePeriodSeconds": 15,
+          "containers": [{
+            "name": "web",
+            "image": "ghcr.io/open-webui/open-webui:v0.13.4-slim@sha256:0c4439e78c24c85e3e7a41936771d3b02f0df38daf28a086cd83ca74804f7676",
+            "env": [
+              {"name": "WEBUI_AUTH", "value": "true"},
+              {"name": "ENABLE_SIGNUP", "value": "false"},
+              {"name": "ENABLE_INITIAL_ADMIN_SIGNUP", "value": "false"},
+              {"name": "WEBUI_SECRET_KEY_FILE", "value": "/app/backend/data/.webui_secret_key"},
+              {"name": "OFFLINE_MODE", "value": "true"},
+              {"name": "ENABLE_OLLAMA_API", "value": "false"},
+              {"name": "OPENAI_API_BASE_URLS", "value": "{{backend_urls}}"}
+            ],
+            "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}],
+            "volumeMounts": [{"name": "data", "mountPath": "/app/backend/data"}],
+            "securityContext": {"runAsUser": 0, "runAsGroup": 0, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+          }],
+          "volumes": [{"name": "data", "hostPath": {"path": "dataset://data", "type": "Directory"}}]
+        }
+      }
+    }
+  }],
+  "datasets": [{"id": "data", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]}],
+  "endpoints": [{"id": "http", "component": "web", "protocol": "tcp", "target_port": 8080, "consumers": ["LAN browsers; sign-in required, self-signup disabled. Plain HTTP; use only on the trusted LAN or via an SSH tunnel."]}],
+  "requires": [{"name": "podman"}, {"name": "systemd"}],
+  "health_checks": [{"id": "health", "component": "web", "type": "http", "endpoint": "http", "path": "/health", "status": 200, "timeout_seconds": 5, "ready_within_seconds": 120}],
+  "provenance": {"submitted_by": "operator", "source": "catalogs/templates/open-webui.json"}
+}

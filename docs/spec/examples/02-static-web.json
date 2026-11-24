@@ -1,0 +1,78 @@
+{
+  "apiVersion": "switchyard/v1alpha3", "kind": "Bundle",
+  "applications": [
+    {
+      "apiVersion": "switchyard/v1alpha3", "kind": "Application",
+      "id": "static-web-template", "revision": 1, "role": "template",
+      "name": "Static web template", "purpose": "Placement-free Pod with a read-only site dataset.",
+      "components": [{
+        "id": "web",
+        "native": {
+          "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+          "manifest": {
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "static-web"},
+            "spec": {
+              "restartPolicy": "Always",
+              "containers": [{
+                "name": "web", "image": "docker.io/nginxinc/nginx-unprivileged@sha256:PLACEHOLDER-resolve-image",
+                "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+                "volumeMounts": [{"name": "site", "mountPath": "/usr/share/nginx/html", "readOnly": true}],
+                "securityContext": {"runAsUser": 101, "runAsGroup": 101, "allowPrivilegeEscalation": false}
+              }],
+              "volumes": [{"name": "site", "hostPath": {"path": "dataset://site", "type": "Directory"}}]
+            }
+          }
+        }
+      }],
+      "datasets": [{"id": "site", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]}],
+      "endpoints": [{"id": "http", "component": "web", "protocol": "tcp", "target_port": 8080, "consumers": ["Browser bookmark", "Firewall rule if exposed beyond loopback"]}],
+      "requires": [{"name": "podman"}, {"name": "systemd"}, {"name": "storage", "capacity": {"disk_gib": 1.0}, "probe_ref": "PLACEHOLDER-storage-and-rootless-ownership-check"}],
+      "health_checks": [{"id": "page", "component": "web", "type": "http", "endpoint": "http", "status": 200, "body_sha256": "PLACEHOLDER-approved-html-hash", "redirects": false}],
+      "provenance": {"submitted_by": "operator-review", "source": "new-static-web-template"}
+    },
+    {
+      "apiVersion": "switchyard/v1alpha3", "kind": "Application",
+      "id": "static-web-garden", "revision": 1, "role": "instance",
+      "template_ref": {"id": "static-web-template", "revision": 1},
+      "name": "Garden static web", "purpose": "Independent instance of the static-web template.",
+      "components": [{
+        "id": "web",
+        "native": {
+          "kind": "kube", "subset": "podman-pod-v2", "mode": "quadlet-kube",
+          "manifest": {
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "static-web-garden"},
+            "spec": {
+              "restartPolicy": "Always",
+              "containers": [{
+                "name": "web", "image": "docker.io/nginxinc/nginx-unprivileged@sha256:PLACEHOLDER-resolve-image",
+                "ports": [{"containerPort": 8080, "protocol": "TCP"}],
+                "volumeMounts": [{"name": "site", "mountPath": "/usr/share/nginx/html", "readOnly": true}],
+                "securityContext": {"runAsUser": 101, "runAsGroup": 101, "allowPrivilegeEscalation": false}
+              }],
+              "volumes": [{"name": "site", "hostPath": {"path": "dataset://site", "type": "Directory"}}]
+            }
+          }
+        },
+        "gates": [{
+          "id": "generation-gate", "kind": "exec-start-pre", "target": "switchyard-static-web-garden-web.service",
+          "covers": "Every systemd start path of the generated Quadlet unit: explicit start, manual systemctl --user start, default.target at boot, Restart=.",
+          "misses": "podman kube play run by hand on the rendered YAML; filesystem rollback of the token file."
+        }]
+      }],
+      "datasets": [{"id": "site", "snapshot": "files-quiesced", "verify": "sha256-manifest", "writers": ["web"], "readers": ["web"]}],
+      "endpoints": [{"id": "http", "component": "web", "protocol": "tcp", "target_port": 8080, "consumers": ["Browser bookmark", "Firewall rule if exposed beyond loopback"]}],
+      "requires": [{"name": "podman"}, {"name": "systemd"}, {"name": "storage", "capacity": {"disk_gib": 1.0}, "probe_ref": "PLACEHOLDER-storage-and-rootless-ownership-check"}],
+      "health_checks": [{"id": "page", "component": "web", "type": "http", "endpoint": "http", "status": 200, "body_sha256": "PLACEHOLDER-approved-html-hash", "redirects": false}],
+      "provenance": {"submitted_by": "operator-review", "source": "static-web-template revision 1"}
+    }
+  ],
+  "placements": [{
+    "apiVersion": "switchyard/v1alpha3", "kind": "Placement",
+    "id": "garden-placement", "application_id": "static-web-garden", "revision": 1,
+    "host_id": "host-a", "generation": 1, "state": "staged",
+    "ownership": "deployed", "ownership_id": "PLACEHOLDER-created-resource-ownership-id",
+    "components": [{"component": "web", "native_identities": [{"native_id": "PLACEHOLDER-generated-quadlet-kube-service", "scope": "user:1000"}]}],
+    "datasets": [{"dataset": "site", "path": "PLACEHOLDER-reviewed-site-path", "access": "write", "ownership": "remap-required", "ownership_check": "PLACEHOLDER-rootless-uid-map-and-read-only-mount-test"}],
+    "endpoints": [{"endpoint": "http", "address": "127.0.0.1", "host_port": 18081}]
+  }]
+}

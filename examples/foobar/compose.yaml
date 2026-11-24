@@ -1,0 +1,33 @@
+# NON-EXECUTED DESIGN. This nginx tag is UNVERIFIED, not a verified digest pin.
+# Runtime installation, image retrieval and deployment require separate approval.
+services:
+  switchyard-foobar:
+    image: nginxinc/nginx-unprivileged:1.28.0-alpine
+    container_name: switchyard-foobar
+    user: "101:101"
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:18080:8080/tcp"
+    volumes:
+      - type: bind
+        source: ./index.html
+        target: /usr/share/nginx/html/index.html
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=101,gid=101,mode=0700
+    cpus: 0.5
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 32
+    logging:
+      driver: local
+      options:
+        max-size: "1m"
+        max-file: "2"
