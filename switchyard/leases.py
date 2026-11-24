@@ -5,6 +5,7 @@ No API accepts ledger paths from an AI or a browser. A lease is coordination,
 not authorization.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -14,6 +15,15 @@ import stat
 import time
 from typing import Iterator
 import uuid
+
+
+# Only leases in the current execution context may be handed to a fixed host
+# payload. Each entry remains live until the outer hold exits.
+_HELD = ContextVar("switchyard_held_ledgers", default=())
+
+
+def held_ledgers():
+    return _HELD.get()
 
 
 class LeaseBusy(RuntimeError):
@@ -50,6 +60,8 @@ class LedgerBroker:
         outcome = "failed"
         token = lease_id or uuid.uuid4().hex
         release = {}
+        held = {"fd": fd, "host_pending": set(), "exported": False}
+        context = None
 
         def append(event: str, **extra):
             data = (json.dumps({"at": datetime.now(timezone.utc).isoformat(), "event": event,
@@ -84,16 +96,21 @@ class LedgerBroker:
             baseline = os.pread(fd, 8192, max(0, opened.st_size - 8192)).decode("utf-8", errors="replace")
             append("CLAIM")
             claimed = True
+            context = _HELD.set((*_HELD.get(), held))
             # `fd` is the locked descriptor (close-on-exec); callers may hand it to one
             # explicitly opted-in child, which then shares this same lock.
             yield {"resource": resource, "lease_id": token, "baseline": baseline, "release": release, "fd": fd}
             outcome = "completed"
         finally:
             try:
-                if claimed:
+                if claimed and not held["host_pending"]:
                     append("RELEASE", outcome=outcome, **release,
                            caveat="Coordination only; consult operation evidence for device state.")
             finally:
-                if acquired:
+                if context is not None:
+                    _HELD.reset(context)
+                # SCM_RIGHTS recipients share this open-file description. Never
+                # explicitly unlock their flock if the worker/container dies.
+                if acquired and not held["exported"]:
                     fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)

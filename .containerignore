@@ -1,0 +1,30 @@
+# Deny by default: private configuration/state never enters the build context.
+**
+!Containerfile
+!.containerignore
+!pyproject.toml
+!uv.lock
+!LICENSE
+!switchyard/
+!switchyard/*.py
+!switchyard/static/
+!switchyard/static/app.js
+!switchyard/static/index.html
+!switchyard/static/style.css
+!switchyard/static/big-shoulders.woff2
+!switchyard/static/source-sans-3.woff2
+!switchyard/static/FONT-LICENSES.txt
+!catalogs/
+!catalogs/example.json
+# Never include generated files, even under an allowed source directory.
+**/__pycache__/**
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.sqlite3
+**/*.sqlite3-*
+**/home-lab*

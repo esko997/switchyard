@@ -10,12 +10,12 @@ import re
 import selectors
 import signal
 import subprocess
-import sys
 import time
 
 from .leases import LedgerBroker, LeaseBusy
 from .models import Snapshot
 from . import container_probe, host_keys, probe
+from . import host_context
 
 MAX_STDOUT = 262144
 MAX_STDERR = 16384
@@ -427,13 +427,18 @@ def collect_host(config: dict, *, mode="full", previous=None) -> dict:
                 config["host_id"], owner="switchyard", scope="read-only observation; configured unit allowlists",
                 worktree=str(Path(__file__).resolve().parents[1]))
         else:
-            command = [sys.executable, "-I", "-S", "-"]
+            command = None
             lease = nullcontext()
         with lease:
             outcome = "failed"
             try:
                 extended = mode == "full" and bool(config.get("paseo", {}).get("cli"))
-                status, output = _run(command, source, started + (26.0 if extended else DEADLINE_SECONDS))
+                budget = 26.0 if extended else DEADLINE_SECONDS
+                if command is None:
+                    with host_context.execution(source, timeout=budget) as (local_command, local_source):
+                        status, output = _run(local_command, local_source, started + budget)
+                else:
+                    status, output = _run(command, source, started + budget)
                 if status != 0:
                     raise CollectionError("Observation transport or probe failed")
                 snapshot = _validate_snapshot(output, config, mode=mode)

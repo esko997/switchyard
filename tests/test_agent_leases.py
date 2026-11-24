@@ -19,6 +19,7 @@ from switchyard import cli, locks
 from switchyard.agent_leases import (
     AgentLeases, LeaseStates, busy_message, caller_identity, enrich_locks,
     process_alive, systemd_argv, ttl_seconds,
+    holder_main,
 )
 from switchyard.leases import LedgerBroker, LeaseBusy
 from switchyard.mcp_server import create_mcp
@@ -108,6 +109,57 @@ class AgentLeaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-symlink"):
             self.manager.resolve("TESTHANDHELD")
         self.assertFalse((self.ledgers / "DEVICE_ACCESS_TESTHANDHELDB.md").exists())
+
+    def test_external_lease_host_exclusions_cover_registry_and_ledger_aliases(self):
+        for denied in ("test-handheld", "TESTHANDHELD"):
+            with patch.dict(os.environ, {"SWITCHYARD_EXTERNAL_LEASE_HOSTS": denied}):
+                for alias in ("test-handheld", "TESTHANDHELD"):
+                    with self.subTest(denied=denied, alias=alias), self.assertRaisesRegex(ValueError, "external lease coordinator"):
+                        self.manager.resolve(alias)
+        with patch.dict(os.environ, {"SWITCHYARD_EXTERNAL_LEASE_HOSTS": "../bad"}), self.assertRaisesRegex(ValueError, "Invalid SWITCHYARD_EXTERNAL"):
+            self.manager.resolve("test-handheld")
+
+    def test_holder_bootstrap_recovers_configured_canonical_mapping(self):
+        configured = self.ledgers / "DEVICE_ACCESS_ALTERNATE.md"
+        self.ledger.rename(configured)
+        self.ledger = configured
+        self.collectors["test-handheld"]["ledger"] = str(configured)
+        state = self.state(release_requested=True)
+        with patch.dict(os.environ, {"SWITCHYARD_LEDGER_DIR": str(self.root / "wrong-default")}):
+            holder_main(self.manager.root, state["lease_id"])
+        self.assertEqual(self.manager.states.read(state["lease_id"])["reason"], "released")
+        self.assertEqual(self.events(), [])
+
+    def test_holder_bootstrap_rejects_request_path_outside_configured_directory(self):
+        state = self.state()
+        other = self.root / "other"
+        other.mkdir()
+        path = other / self.ledger.name
+        path.write_text("not canonical\n")
+        self.manager.states.update(state["lease_id"], lambda value: value.update(ledger=str(path)))
+        with self.assertRaisesRegex(ValueError, "ledger changed"):
+            holder_main(self.manager.root, state["lease_id"])
+        self.assertEqual(path.read_text(), "not canonical\n")
+
+    def test_integrated_hold_requires_explicit_host_executable(self):
+        for executable in ("", "relative", "/host/../unsafe", "/host/helper\n"):
+            with self.subTest(executable=executable), patch.dict(os.environ, {
+                    "SWITCHYARD_CONTAINER_HOST": "1", "SWITCHYARD_HOST_HOLDER": executable}):
+                with self.assertRaisesRegex(ValueError, "absolute trusted SWITCHYARD_HOST_HOLDER"):
+                    self.manager.hold("TESTHANDHELD", scope="fixture")
+        self.runner.assert_not_called()
+        self.assertEqual(self.manager.states.records(), [])
+
+    def test_integrated_hold_uses_only_native_host_wrapper(self):
+        def start(argv, **kwargs):
+            state = self.manager.states.read(argv[-1])
+            self.assertEqual(argv[argv.index("--") + 1:], [
+                "/usr/bin/env", "--", "/host/bin/switchyard", "--state-dir", str(self.manager.root.resolve()),
+                "lease", "_holder", state["lease_id"]])
+            self.manager.states.update(state["lease_id"], lambda value: value.update(status="claimed"))
+        self.runner.side_effect = start
+        with patch.dict(os.environ, {"SWITCHYARD_CONTAINER_HOST": "1", "SWITCHYARD_HOST_HOLDER": "/host/bin/switchyard"}):
+            self.manager.hold("TESTHANDHELD", scope="fixture")
 
     def test_same_inode_exclusion_with_other_process_and_busy_cli_75(self):
         inode = self.ledger.stat().st_ino

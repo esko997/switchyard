@@ -8,6 +8,7 @@ import sys
 import time
 
 from .collector import _json, _ssh_command
+from . import host_context
 
 MAX_OUTPUT = 262144
 MAX_ERRORS = 16384
@@ -99,8 +100,11 @@ def run_remote(host: dict, source: str, payload: dict, *, timeout: int = 60, loc
                 "PAYLOAD = json.loads(" + repr(json.dumps(payload, allow_nan=False)) + ")\n"
                 "exec(compile(" + repr(source) + ", '<switchyard-action>', 'exec'))\n")
     try:
-        command = [sys.executable, "-I", "-S", "-"] if local else _ssh_command(host)
-        status, output = run_bounded(command, preamble.encode(), timeout=timeout)
+        if local:
+            with host_context.execution(preamble.encode(), timeout=timeout) as (command, data):
+                status, output = run_bounded(command, data, timeout=timeout)
+        else:
+            status, output = run_bounded(_ssh_command(host), preamble.encode(), timeout=timeout)
         if status != 0:
             raise RemoteError("SSH operation failed; remote effects need inspection")
         value = _json(output)

@@ -26,6 +26,16 @@ uv run --locked switchyard --catalog catalogs/example.json plan-migration foobar
 
 The migration command produces an offline proposal with evidence gaps, not a runnable script. The nginx image tag in the example is unverified. Nothing is installed, contacted, started or stopped by these commands.
 
+### Rootless Podman option
+
+```sh
+podman build --file Containerfile --tag localhost/switchyard:local .
+tools/run-container.sh demo --image localhost/switchyard:local
+# GET-only fictional desk: http://localhost:8710 (requires host slirp4netns)
+```
+
+The image packages Python 3.13 and locked dependencies; the build context is allowlisted and includes no private fleet configuration or state. The disposable demo mounts no host files. For a real control plane, [integrated container mode](docs/container.md) preserves canonical catalog/state/ledger paths and runs as the control user's UID with explicitly selected SSH, SDK and playbook mounts. It shares host PID/network and the systemd user bus: **packaging, not isolation**. Existing native CLI access, policies, approvals, leases and systemd timers remain in charge.
+
 ## Configure your own fleet
 
 Keep private addresses, accounts, serials and policy in your own configuration, not the tracked examples:
@@ -177,6 +187,7 @@ Add your reviewed absolute `--collectors`, `--operations` and `--state-dir` argu
 - [Device access](docs/access.md), [observation contract](docs/observation-contract.md), [agent briefing](docs/agent-briefing.md)
 - [Workload specification](docs/spec/workload.md), [deployment](docs/deploy.md), [registered-application tokens](docs/tokens.md)
 - [Ansible](docs/ansible.md), [remote agents](docs/remote-agents.md), [authentication](docs/auth.md)
+- [Rootless container packaging and systemd setup](docs/container.md)
 - [Disposable rehearsal](docs/disposable-workload.md), [roadmap](docs/roadmap.md)
 
 Tests use isolated fixtures and temporary ledgers. A test run is not evidence that your hosts support an operation:

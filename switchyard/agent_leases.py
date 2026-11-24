@@ -23,6 +23,7 @@ import uuid
 
 from . import locks
 from .leases import LedgerBroker, LeaseBusy
+from . import host_context
 
 def host_label(host_id):
     """Ledger label for a registry host without a configured ledger: `host-a` -> HOSTA."""
@@ -523,6 +524,15 @@ class AgentLeases:
         if label not in known:
             raise ValueError(f"Unknown lease device: {device} (not a Switchyard registry host)")
         path = self.ledger_dir / f"DEVICE_ACCESS_{label}.md"
+        external = os.environ.get("SWITCHYARD_EXTERNAL_LEASE_HOSTS", "")
+        denied = [item.strip() for item in external.split(",") if item.strip()]
+        if len(denied) > 256 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", item) for item in denied):
+            raise ValueError("Invalid SWITCHYARD_EXTERNAL_LEASE_HOSTS")
+        aliases = {device.casefold(), label.casefold(), (host or "").casefold()}
+        aliases.update(name.casefold() for name, item in self.collectors.items() if item.get("ledger") == str(path))
+        aliases.update(name.casefold() for name in self.hosts if host_label(name) == label)
+        if aliases & {item.casefold() for item in denied}:
+            raise ValueError(f"Host {device} requires its external lease coordinator")
         try:
             info = path.lstat()
         except FileNotFoundError as error:
@@ -576,7 +586,7 @@ class AgentLeases:
         self._refuse_if_blocked(label)
         identity = origin or caller_identity(self.paseo_agents)
         lease_id = uuid.uuid4().hex
-        state = {"lease_id": lease_id, "device": label, "ledger": str(path),
+        state = {"lease_id": lease_id, "device": label, "ledger": str(path), "ledger_dir": str(self.ledger_dir),
                  **identity, "owner": identity["owner"] if origin or owner is None else _text(owner),
                  "scope": _text(scope), "worktree": _text(str(worktree if worktree is not None else Path.cwd())),
                  "mode": mode, "status": "starting", "created_at": _iso(self.clock()),
@@ -1109,8 +1119,19 @@ class AgentLeases:
         if detached:
             state["detached"] = True
             state["via"] = "switchyard lease hold --detached" + (f" from {origin['origin_host']}" if origin else "")
+        if host_context.enabled():
+            executable = os.environ.get("SWITCHYARD_HOST_HOLDER", "")
+            path = Path(executable)
+            if (not executable or not path.is_absolute() or str(path) != executable or ".." in path.parts
+                    or any(ord(character) < 32 or ord(character) == 127 for character in executable)):
+                raise ValueError("Integrated containers require an absolute trusted SWITCHYARD_HOST_HOLDER executable")
+            # systemd-run checks argv[0] in the container before handing it to
+            # the host manager. The helper itself exists only on the host.
+            command = ["/usr/bin/env", "--", executable]
+        else:
+            command = [sys.executable, "-m", "switchyard.cli"]
+        command += ["--state-dir", str(self.root.resolve()), "lease", "_holder", state["lease_id"]]
         self.states.update(state["lease_id"], lambda value: value.update(state), create=True)
-        command = [sys.executable, "-m", "switchyard.cli", "--state-dir", str(self.root.resolve()), "lease", "_holder", state["lease_id"]]
         started = self.monotonic()
         try:
             try:
@@ -1255,5 +1276,15 @@ class AgentLeases:
 def holder_main(root, lease_id):
     states = LeaseStates(Path(root) / "leases")
     state = states.read(lease_id)
-    # The caller resolved the device against the registry; the holder re-checks the same ledger path.
-    AgentLeases(state_dir=root, ledger_dir=Path(state["ledger"]).parent, hosts=(state["device"],)).holder(lease_id)
+    # Private held state contains the configured canonical directory, not a
+    # request-supplied arbitrary pathname. Rebuild the exact label mapping:
+    # host_label(device) is not necessarily the configured collector label.
+    directory = Path(state.get("ledger_dir", locks.DEFAULT_LEDGER_DIR))
+    label = state.get("device")
+    if (not directory.is_absolute() or directory != directory.resolve(strict=True)
+            or not isinstance(label, str) or not re.fullmatch(r"[A-Z0-9]{1,64}", label)):
+        raise ValueError("Invalid canonical holder ledger mapping")
+    path = directory / f"DEVICE_ACCESS_{label}.md"
+    if state.get("ledger") != str(path):
+        raise ValueError("Lease ledger changed")
+    AgentLeases(state_dir=root, ledger_dir=directory, collectors={"holder": {"ledger": str(path)}}).holder(lease_id)

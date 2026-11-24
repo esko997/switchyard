@@ -127,6 +127,13 @@ def main():
                      help="Serve the authenticated desk over HTTPS on a private LAN address (docs/auth.md)")
     web.add_argument("--name", action="append", default=[], metavar="DNS_OR_IP",
                      help="Additional name the --lan server certificate must cover (repeatable)")
+    stack = commands.add_parser("container-service", help="Run the loopback desk, optional HTTPS desk and configured monitor together")
+    stack.add_argument("--port", type=int, default=8710)
+    stack.add_argument("--lan-host", help="Private literal address for the optional HTTPS desk")
+    stack.add_argument("--lan-port", type=int, default=8712)
+    stack.add_argument("--allowed-clients", help="Private client CIDR for the HTTPS desk")
+    stack.add_argument("--name", action="append", default=[], metavar="DNS_OR_IP",
+                       help="Additional HTTPS certificate name (repeatable)")
     auth.register_cli(commands)
     ansible_ops.register_cli(commands)
     deploy.register_cli(commands)
@@ -201,6 +208,9 @@ def main():
             from .agent_leases import holder_main, state_root
             holder_main(args.state_dir or state_root(), args.lease_id)
             return
+        if args.command == "container-service":
+            from .service_stack import serve_stack
+            raise SystemExit(serve_stack(args))
         if args.command == "web":
             from .web import serve
             lan = {"lan": True, "names": args.name} if args.lan else {}
