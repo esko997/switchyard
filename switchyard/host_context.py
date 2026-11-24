@@ -116,7 +116,9 @@ def execution(source, *, timeout):
     command = ["systemd-run", "--user", "--pipe", "--wait", "--collect", "--quiet", f"--unit={unit}",
                f"--property=RuntimeMaxSec={math.ceil(timeout)}", "--property=TimeoutStopSec=5",
                "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
-               "--", "/usr/bin/python3", "-I", "-S", "-"]
+               # systemd-run resolves argv[0] inside the image before handing
+               # the command off. The host interpreter need not exist there.
+               "--", "/usr/bin/env", "--", "/usr/bin/python3", "-I", "-S", "-"]
     wrapped = (_HOST_PREAMBLE.format(address=address, count=len(entries))
                + "exec(compile(" + repr(source) + ", '<switchyard-host-payload>', 'exec'))\n").encode()
     thread.start()

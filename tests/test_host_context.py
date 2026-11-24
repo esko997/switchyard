@@ -61,7 +61,7 @@ class HostContextTests(unittest.TestCase):
             for flag in ("--user", "--pipe", "--wait", "--collect", "--quiet", "--property=RuntimeMaxSec=3",
                          "--property=KillMode=control-group", "--property=TimeoutStopSec=5"):
                 self.assertIn(flag, argv)
-            self.assertEqual(argv[-5:], ["--", "/usr/bin/python3", "-I", "-S", "-"])
+            self.assertEqual(argv[-7:], ["--", "/usr/bin/env", "--", "/usr/bin/python3", "-I", "-S", "-"])
             status, output = remote.run_bounded([sys.executable, "-I", "-S", "-"], source, timeout=3)
             self.assertEqual((status, output), (0, b"ready\n"))
 

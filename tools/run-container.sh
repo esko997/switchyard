@@ -109,7 +109,7 @@ if [[ $mode == demo ]]; then
     [[ $port =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1024 && 10#$port <= 65535 )) || die 'demo port must be 1024..65535'
     home_dir=/run/switchyard-demo
     # slirp4netns gives the guest 10.0.2.100; only the host loopback is published.
-    run+=(--network=slirp4netns:cidr=10.0.2.0/24 --publish "127.0.0.1:$port:$port")
+    run+=(--stop-signal=SIGINT --network=slirp4netns:cidr=10.0.2.0/24 --publish "127.0.0.1:$port:$port")
     args=(--catalog /opt/switchyard/catalogs/example.json --state-dir /tmp/switchyard-state
         web --lan-read-only --host 10.0.2.100 --port "$port" --allowed-clients 10.0.2.0/24)
 else
