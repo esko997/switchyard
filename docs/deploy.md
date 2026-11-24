@@ -484,8 +484,9 @@ return `NXDOMAIN` instead of falling back.
 
 **Candidates come from workloads.** Declare `scheme: http` or `scheme: https` on the
 application's TCP endpoint and bind it to an exact private IPv4 address and port in its
-placement. For an observed service, use **Edit definition → Web endpoints** to save both
-pieces in the workload store. A registered application uses its bundle's declarations;
+placement. For an observed service, declare both under **Web endpoints** when you
+first **Define workload**, or change them later with **Edit definition**.
+A registered application uses its bundle's declarations;
 a deployment uses its current placement. Older applications with an unambiguous HTTP
 check can still supply the scheme. No check has to run to list candidates.
 Loopback, wildcard, non-web and ambiguous targets are not eligible. An adopted endpoint's

@@ -95,11 +95,11 @@ class DefinitionManagementTests(unittest.TestCase):
         self.assertEqual(provenance["source_evidence"][0]["native_id"], "notes.service")
         self.assertEqual(self.service.definition_inventory()["workloads"], [saved["definition"]])
 
-    def test_reviewed_web_endpoint_becomes_a_route_candidate_without_publishing(self):
-        saved = self.save()
+    def test_first_save_declares_a_route_candidate_without_publishing(self):
         endpoint = {"id": "desk", "address": "192.168.50.104", "port": 8710, "scheme": "http"}
-        definition = {**saved["definition"], "endpoints": [endpoint]}
-        updated = self.service.update_workload_definition("notes", definition, expected_revision=saved["revision"])
+        proposal = self.proposal()
+        proposal["definition"]["endpoints"] = [endpoint]
+        saved = self.save(proposal)
         other = self.new_service()
         self.assertEqual(other.definition_inventory()["workloads"][0]["endpoints"], [endpoint])
         config = lan_route_config.normalize({"gateway_id": "lan-web", "dns_id": "lan-dns",
@@ -109,8 +109,8 @@ class DefinitionManagementTests(unittest.TestCase):
         rows = lan_route_config.endpoint_candidates(other._store, config, hosts=hosts)
         plan = lan_route_config.route(config, rows, "notes-desk", "notes", "desk")
         self.assertEqual((plan["address"], plan["port"], plan["scheme"]), ("192.168.50.104", 8710, "http"))
-        other.update_workload_definition("notes", {**updated["definition"], "endpoints": []},
-                                         expected_revision=updated["revision"])
+        other.update_workload_definition("notes", {**saved["definition"], "endpoints": []},
+                                         expected_revision=saved["revision"])
         self.assertEqual(lan_route_config.endpoint_candidates(other._store, config, hosts=hosts), [])
 
     def test_endpoint_metadata_rejects_false_port_urls_and_duplicate_ids(self):
