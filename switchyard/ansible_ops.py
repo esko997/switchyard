@@ -112,8 +112,9 @@ def validate_playbook(playbook_id, entry):
     if not repo.is_absolute():
         raise ValueError(f"Playbook {playbook_id}: repo must be an absolute path (~ allowed)")
     spec = {"repo": str(repo), "playbook": _relative(entry["playbook"], "playbook"),
-            "allowed_hosts": _names(entry["allowed_hosts"], "allowed_hosts", host_registry.IDENTIFIER,
-                                    minimum=1, maximum=128),
+            "allowed_hosts": ("all-linux" if entry["allowed_hosts"] == "all-linux" else
+                              _names(entry["allowed_hosts"], "allowed_hosts", host_registry.IDENTIFIER,
+                                     minimum=1, maximum=128)),
             "groups": _names(entry["groups"], "groups", GROUP, minimum=1, maximum=16),
             "extra_vars_allowed": sorted(_names(entry["extra_vars_allowed"], "extra_vars_allowed", VAR_NAME)),
             "secret_vars": sorted(_names(entry.get("secret_vars", []), "secret_vars", VAR_NAME)),
@@ -695,6 +696,27 @@ class AnsibleOps:
             raise ValueError(f"{host_id} is missing from Switchyard's SSH pin file")
         return record
 
+    @staticmethod
+    def _linux_ssh(record):
+        return (record.get("platform") == "linux"
+                and (record.get("collector") or {}).get("transport") == "ssh")
+
+    def _target_ids(self, spec):
+        if spec["allowed_hosts"] != "all-linux":
+            return spec["allowed_hosts"]
+        return sorted(host_id for host_id, record in self.hosts.items() if self._linux_ssh(record))
+
+    def _target(self, spec, host_id, playbook_id):
+        allowed = spec["allowed_hosts"]
+        automatic = allowed == "all-linux"
+        if not isinstance(host_id, str) or (
+                not self._linux_ssh(self.hosts.get(host_id, {})) if automatic else host_id not in allowed):
+            raise ValueError(f"{host_id} is not allowed for playbook {playbook_id}")
+        record = self._host(host_id)
+        if automatic and (record.get("verification") or {}).get("state") != "verified":
+            raise ValueError(f"{host_id} must have a verified SSH connection before it can run this playbook")
+        return record
+
     def _repo(self, spec):
         """The registered repo and playbook: inside the operator's home, the operator's own files, no symlink
         leading outside the repo."""
@@ -735,10 +757,11 @@ class AnsibleOps:
         discovery.owned_file(repo, spec["playbook"], "Playbook")
         if "inventory" in spec:
             discovery.owned_file(repo, spec["inventory"], "Inventory")
-        for host_id in spec["allowed_hosts"]:
-            record = self.hosts.get(host_id)
-            if record is None or (record.get("collector") or {}).get("transport") != "ssh":
-                raise ValueError(f"{host_id} is not an SSH host in the host registry")
+        if spec["allowed_hosts"] != "all-linux":
+            for host_id in spec["allowed_hosts"]:
+                record = self.hosts.get(host_id)
+                if record is None or (record.get("collector") or {}).get("transport") != "ssh":
+                    raise ValueError(f"{host_id} is not an SSH host in the host registry")
         return spec
 
     def _editor(self):
@@ -763,12 +786,12 @@ class AnsibleOps:
 
     # ---- reads -------------------------------------------------------------------------
 
-    def _host_rows(self, spec, privilege):
+    def _host_rows(self, playbook_id, spec, privilege):
         hosts = []
-        for host_id in spec["allowed_hosts"]:
+        for host_id in self._target_ids(spec):
             row = {"host_id": host_id, "eligible": True, **(privilege.get(host_id) or {"passwordless_sudo": None})}
             try:
-                self._host(host_id)
+                self._target(spec, host_id, playbook_id)
             except ValueError as error:
                 row.update(eligible=False, reason=str(error))
             hosts.append(row)
@@ -784,7 +807,7 @@ class AnsibleOps:
             repo_view = {"error": str(error)}
         return {"id": registration["id"], "revision": registration["revision"], **deepcopy(spec),
                 "registered": {key: registration[key] for key in ("created_at", "updated_at", "updated_by")},
-                "repo_state": repo_view, "hosts": self._host_rows(spec, privilege)}
+                "repo_state": repo_view, "hosts": self._host_rows(registration["id"], spec, privilege)}
 
     def playbooks(self):
         privilege = self.store.privilege()
@@ -805,7 +828,7 @@ class AnsibleOps:
         repo, _ = self._repo(spec)
         state = repo_state(repo)
         hosts = {host_id: (self.hosts.get(host_id) or {}).get("collector", {}).get("expected_hostname")
-                 for host_id in spec["allowed_hosts"]}
+                 for host_id in self._target_ids(spec)}
         key = digest([playbook_id, spec, state["fingerprint"], self.runner.version, hosts, str(self.home)])
         with _DISCOVERY_LOCK:
             if key in _DISCOVERY:
@@ -823,7 +846,7 @@ class AnsibleOps:
                 listing = discovery.inventory_listing(self.runner, repo, path, (repo / spec["playbook"]).parent)
             except ValueError as error:
                 problems.append(str(error))
-        for host_id in spec["allowed_hosts"]:
+        for host_id in hosts:
             record = self.hosts.get(host_id)
             if record is None:
                 layers[host_id] = {"values": {}, "error": "not in the host registry"}
@@ -928,11 +951,10 @@ class AnsibleOps:
             spec = self._playbook(playbook_id)
             if host_id is None:
                 raise ValueError("--playbook needs --host")
-            if host_id not in spec["allowed_hosts"]:
-                raise ValueError(f"{host_id} is not allowed for playbook {playbook_id}")
+            record = self._target(spec, host_id, playbook_id)
             repo, _ = self._repo(spec)
             self.runner.prepare()
-            inventory, info = self._inventory_for(spec, self._host(host_id), repo)
+            inventory, info = self._inventory_for(spec, record, repo)
             return {"inventory": inventory, "sha256": digest(inventory), "layering": info, "refused": []}
         selected = [host_id] if host_id is not None else list(self.hosts)
         hosts, refused = {}, []
@@ -1209,9 +1231,7 @@ class AnsibleOps:
         password = become_password if isinstance(become_password, BecomePassword) else BecomePassword(become_password)
         try:
             spec = self._playbook(playbook_id)
-            if host_id not in spec["allowed_hosts"]:
-                raise ValueError(f"{host_id} is not allowed for playbook {playbook_id}")
-            record = self._host(host_id)
+            record = self._target(spec, host_id, playbook_id)
             if password and not spec["become"]:
                 raise ValueError("This playbook is not registered as using become; no sudo password is needed")
             if type(allow_dirty) is not bool:
@@ -1330,7 +1350,7 @@ class AnsibleOps:
         spec = self._playbook(plan["playbook_id"])
         if digest(spec) != plan["playbook"]["spec_sha256"]:
             raise ValueError("Playbook registration changed since the plan; make a new plan")
-        record = self._host(plan["host_id"])
+        record = self._target(spec, plan["host_id"], plan["playbook_id"])
         if registry_digest(record) != plan["registry_sha256"]:
             raise ValueError("Host registry entry changed since the plan; make a new plan")
         repo, playbook = self._repo(spec)
@@ -1591,7 +1611,9 @@ def register_cli(commands):
         registration.add_argument("--playbook", required=True, help="Playbook file, relative to the repo")
         registration.add_argument("--inventory", help="Repo inventory, relative to the repo")
         registration.add_argument("--group", action="append", required=True, help="Group the host joins (repeatable)")
-        registration.add_argument("--host", action="append", required=True, help="Allowed registry host (repeatable)")
+        targets = registration.add_mutually_exclusive_group(required=True)
+        targets.add_argument("--host", action="append", help="Allowed registry host (repeatable)")
+        targets.add_argument("--all-linux-hosts", action="store_true", help="All verified Linux SSH registry hosts")
         registration.add_argument("--become", action="store_true", help="The playbook escalates privilege")
         registration.add_argument("--check-mode", required=True, choices=sorted(CHECK_MODES))
         registration.add_argument("--description", required=True)
@@ -1675,7 +1697,8 @@ def from_service(service, path, **kwargs):
 
 
 def _entry(args):
-    entry = {"repo": args.repo, "playbook": args.playbook, "groups": args.group, "allowed_hosts": args.host,
+    entry = {"repo": args.repo, "playbook": args.playbook, "groups": args.group,
+             "allowed_hosts": "all-linux" if args.all_linux_hosts else args.host,
              "become": args.become, "check_mode": args.check_mode, "description": args.description,
              "extra_vars_allowed": args.var, "secret_vars": args.secret_var}
     if args.inventory:

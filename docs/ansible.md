@@ -41,7 +41,7 @@ Tests: `tests/test_ansible_ops.py` (runner, plans, applies, callback) and `tests
 | `playbook` | Playbook file, relative to `repo`, `.yml`/`.yaml` |
 | `inventory` | Optional repo inventory, relative to `repo` (see "Layering") |
 | `groups` | 1-16 groups the generated host joins, so the play's `hosts:` pattern matches. A registry host has no Ansible groups of its own |
-| `allowed_hosts` | Registry host IDs this playbook may target (SSH hosts) |
+| `allowed_hosts` | Explicit registry SSH host IDs, or `"all-linux"` to include current and future verified Linux SSH hosts |
 | `become` | The operator's declaration that the playbook escalates. Discovery shows whether its plays say `become: true` |
 | `check_mode` | `full`, `partial` or `unsupported`: how far a plan can be trusted. `unsupported` runs only the preflight |
 | `extra_vars_allowed` | Variables the operator may override per run. `ansible_*` and `switchyard_*` are refused, so overrides cannot redirect the connection or the privilege settings |
@@ -54,13 +54,15 @@ Registering and editing check more than the seed does:
 - The directory must resolve, after every symlink, inside the operator's home directory; a symlink that leads outside is refused.
 - The repository root, the playbook and the inventory must be owned by the operator and not writable by every user; the playbook and inventory must resolve inside the repository.
 - The repository must be the root of a Git work tree.
-- Every allowed host must be an SSH host in the registry.
+- An explicit host list names SSH hosts in the registry. The all-Linux option instead checks host OS, pinned SSH keys and verified connection at target selection and again at apply.
 
 The same path and ownership checks run again before every discovery, plan and apply.
 
 ### Register an operator-owned playbook
 
 Start with `catalogs/ansible.example.json` or register a repository in the Playbooks tab. Choose a real Git checkout inside your home, a relative playbook path, groups matching its `hosts:` pattern, and explicit registry host IDs such as `host-a`. Set `become` and check-mode trust from the playbook, not from the example. A registration is not permission to apply it.
+
+For a playbook intended to run on new Linux hosts without editing its registration, choose **All verified Linux SSH hosts** in the desk (CLI: `--all-linux-hosts`). Existing playbooks keep their explicit lists. If you register a repository inventory, the target must also be present there for its host and group variables. Eligibility never starts a run: planning and approved apply still target one leased host at a time.
 
 Inspect task behavior before relying on check mode: skipped commands and first-run package/configuration effects may be unpredicted, while `check_mode: false` probes actually run during planning. Mark sensitive variables and permit only reviewed overrides.
 

@@ -4138,7 +4138,11 @@
     checkMode.value = item ? item.check_mode : "partial";
     const hosts = node("fieldset", undefined, "host-choices");
     const hostBoxes = new Map();
-    hosts.append(node("legend", "May run on"), node("p", "Registry hosts reached over SSH. The playbook can run on these only.", "field-note"));
+    hosts.append(node("legend", "May run on"));
+    const allLinux = node("input");
+    Object.assign(allLinux, { type: "checkbox", id: "playbook-all-linux", checked: item?.allowed_hosts === "all-linux" });
+    hosts.append(group("label", "check-label", allLinux, node("span", "All verified Linux SSH hosts")),
+      node("p", "Includes future verified Linux hosts. Repository inventory requirements, run approval and host leases still apply.", "field-note"));
     const choices = node("ul", undefined, "host-choice-list");
     strings(found.ssh_hosts).forEach((hostId) => {
       const box = node("input");
@@ -4150,7 +4154,12 @@
       if (name !== hostId) choice.append(node("span", hostId, "machine row-sub"));
       choices.append(group("li", "", choice));
     });
-    hosts.append(strings(found.ssh_hosts).length ? choices : empty("No SSH hosts in the registry."));
+    const selectedHosts = group("div", "", node("p", "Or choose specific registry hosts reached over SSH.", "field-note"),
+      hostBoxes.size ? choices : empty("No SSH hosts in the registry."));
+    const showHostChoices = () => { selectedHosts.hidden = allLinux.checked; };
+    allLinux.addEventListener("change", showHostChoices);
+    showHostChoices();
+    hosts.append(selectedHosts);
     const variables = node("div", undefined, "registration-vars");
     const save = button(editor.mode === "add" ? "Register playbook" : "Save changes", "primary", "save-registration");
     const chosen = { allowed: new Set(strings(item?.extra_vars_allowed)), secret: new Set(strings(item?.secret_vars)) };
@@ -4190,7 +4199,7 @@
     playbook.addEventListener("change", () => fillPlaybook(false));
     inventory.addEventListener("change", () => fillPlaybook(false));
     fillPlaybook(true);
-    save.addEventListener("click", () => saveRegistration({ id, description, playbook, inventory, groups, become, checkMode, hostBoxes, chosen, save }));
+    save.addEventListener("click", () => saveRegistration({ id, description, playbook, inventory, groups, become, checkMode, allLinux, hostBoxes, chosen, save }));
     parts.push(group("div", "operation-fields",
       field("Playbook ID", id, editor.mode === "add" ? "Lowercase letters, digits and hyphens. Cannot change later." : `Revision ${item.revision}.`),
       field("Playbook file", playbook), field("Inventory", inventory, "Its host and group variables reach the run; its connection settings never do.")),
@@ -4207,7 +4216,7 @@
     const registration = {
       description: form.description.value.trim(), repo: editor.inspection.path, playbook: form.playbook.value,
       groups: form.groups.value.split(",").map((value) => value.trim()).filter(Boolean),
-      allowed_hosts: Array.from(form.hostBoxes).filter(([, box]) => box.checked).map(([hostId]) => hostId),
+      allowed_hosts: form.allLinux.checked ? "all-linux" : Array.from(form.hostBoxes).filter(([, box]) => box.checked).map(([hostId]) => hostId),
       become: form.become.checked, check_mode: form.checkMode.value,
       extra_vars_allowed: Array.from(form.chosen.allowed).sort(), secret_vars: Array.from(form.chosen.secret).sort(),
     };
@@ -4295,7 +4304,11 @@
     return `${text(item?.scheme, "http")}://${address.includes(":") && !address.startsWith("[") ? `[${address}]` : address}${number(item?.port) ? `:${item.port}` : ""}`;
   }
   function lanEndpointLabel(item) {
-    return `${text(item?.endpoint_id)}: ${lanTarget(item)}${lanProfile(item) !== "plain" ? `, profile ${lanProfile(item)}` : ""}`;
+    const endpoint = text(item?.endpoint_id, "");
+    const scheme = text(item?.scheme, "http");
+    const profile = lanProfile(item);
+    const label = endpoint && endpoint.replace(/:(?:\/\/)?$/, "") !== scheme ? `${endpoint}: ` : "";
+    return `${label}${lanTarget(item)}${profile !== "plain" ? `, profile ${profile}` : ""}`;
   }
   // The zones already in use, to suggest the shape of a new name. The server decides which zones are allowed.
   function lanZones() {

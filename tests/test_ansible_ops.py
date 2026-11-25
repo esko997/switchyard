@@ -299,6 +299,34 @@ class AnsibleOpsTests(AnsibleFixture):
         self.assertEqual(view["layering"]["repo_vars_replaced"], ["ansible_host", "ansible_user"])
         self.assertEqual(sorted(view["inventory"]["all"]["children"]), ["compute_hosts", "desktops"])
 
+    def test_all_linux_scope_tracks_registry_without_widening_existing_playbooks(self):
+        base, unpinned, handheld = self.records
+        base.update(platform="linux", verification={"state": "verified"})
+        unpinned.update(platform="linux", verification={"state": "verified"})
+        handheld.update(platform="android")
+        entry = {**self.config["playbooks"]["host-init"], "allowed_hosts": "all-linux"}
+        entry.pop("inventory")  # This playbook uses the generated inventory alone.
+        self.ops().register("all-linux-init", entry)
+
+        later = {**base, "id": "later-linux", "verification": {"state": "pending"},
+                 "collector": {**base["collector"], "host_id": "later-linux"}}
+        self.records.extend([later, {**base, "id": "not-linux", "platform": "android"}])
+        with self.pins.open("a") as pins:
+            pins.write("switchyard-later-linux " + public_key() + "\n")
+        with self.assertRaisesRegex(ValueError, "verified SSH connection"):
+            self.ops().plan("all-linux-init", "later-linux")
+        later["verification"] = {"state": "verified"}
+        ops = self.ops()
+        rows = {p["id"]: {r["host_id"]: r["eligible"] for r in p["hosts"]} for p in ops.playbooks()["playbooks"]}
+        self.assertEqual(rows["all-linux-init"], {"host-a": True, "later-linux": True, "test-portable": False})
+        self.assertNotIn("later-linux", rows["host-init"])
+        for host in ("test-handheld", "not-linux"):
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                ops.plan("all-linux-init", host)
+        inventory = ops.inventory("later-linux", "all-linux-init")["inventory"]
+        self.assertEqual(list(inventory["all"]["hosts"]), ["later-linux"])
+        self.assertEqual(inventory["all"]["children"]["compute_hosts"], {"hosts": {"later-linux": {}}})
+
     # ---- plan ----
 
     def test_dirty_repo_is_refused_unless_allowed_and_recorded(self):
